@@ -27,6 +27,7 @@
 #include <linux/kmod.h>
 #include <linux/reboot.h>
 #include <linux/slab.h>
+#include <linux/smp_lock.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 
@@ -698,6 +699,7 @@ envctrl_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 static int
 envctrl_open(struct inode *inode, struct file *file)
 {
+	cycle_kernel_lock();
 	file->private_data = NULL;
 	return 0;
 }
@@ -720,7 +722,6 @@ static const struct file_operations envctrl_fops = {
 #endif
 	.open =			envctrl_open,
 	.release =		envctrl_release,
-	.llseek =		noop_llseek,
 };	
 
 static struct miscdevice envctrl_dev = {
@@ -1028,7 +1029,8 @@ static int kenvctrld(void *__unused)
 	return 0;
 }
 
-static int __devinit envctrl_probe(struct platform_device *op)
+static int __devinit envctrl_probe(struct of_device *op,
+				   const struct of_device_id *match)
 {
 	struct device_node *dp;
 	int index, err;
@@ -1104,7 +1106,7 @@ out_iounmap:
 	return err;
 }
 
-static int __devexit envctrl_remove(struct platform_device *op)
+static int __devexit envctrl_remove(struct of_device *op)
 {
 	int index;
 
@@ -1128,7 +1130,7 @@ static const struct of_device_id envctrl_match[] = {
 };
 MODULE_DEVICE_TABLE(of, envctrl_match);
 
-static struct platform_driver envctrl_driver = {
+static struct of_platform_driver envctrl_driver = {
 	.driver = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
@@ -1140,12 +1142,12 @@ static struct platform_driver envctrl_driver = {
 
 static int __init envctrl_init(void)
 {
-	return platform_driver_register(&envctrl_driver);
+	return of_register_driver(&envctrl_driver, &of_bus_type);
 }
 
 static void __exit envctrl_exit(void)
 {
-	platform_driver_unregister(&envctrl_driver);
+	of_unregister_driver(&envctrl_driver);
 }
 
 module_init(envctrl_init);

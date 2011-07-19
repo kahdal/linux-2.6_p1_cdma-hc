@@ -225,14 +225,15 @@ static void sxps2_close(struct serio *pserio)
 /**
  * xps2_of_probe - probe method for the PS/2 device.
  * @of_dev:	pointer to OF device structure
- * @match:	pointer to the structure used for matching a device
+ * @match:	pointer to the stucture used for matching a device
  *
  * This function probes the PS/2 device in the device tree.
  * It initializes the driver data structure and the hardware.
  * It returns 0, if the driver is bound to the PS/2 device, or a negative
  * value if there is an error.
  */
-static int __devinit xps2_of_probe(struct platform_device *ofdev)
+static int __devinit xps2_of_probe(struct of_device *ofdev,
+				   const struct of_device_id *match)
 {
 	struct resource r_irq; /* Interrupt resources */
 	struct resource r_mem; /* IO mem resources */
@@ -331,7 +332,7 @@ failed1:
  * if the driver module is being unloaded. It frees any resources allocated to
  * the device.
  */
-static int __devexit xps2_of_remove(struct platform_device *of_dev)
+static int __devexit xps2_of_remove(struct of_device *of_dev)
 {
 	struct device *dev = &of_dev->dev;
 	struct xps2data *drvdata = dev_get_drvdata(dev);
@@ -360,7 +361,7 @@ static const struct of_device_id xps2_of_match[] __devinitconst = {
 };
 MODULE_DEVICE_TABLE(of, xps2_of_match);
 
-static struct platform_driver xps2_of_driver = {
+static struct of_platform_driver xps2_of_driver = {
 	.driver = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
@@ -372,12 +373,12 @@ static struct platform_driver xps2_of_driver = {
 
 static int __init xps2_init(void)
 {
-	return platform_driver_register(&xps2_of_driver);
+	return of_register_platform_driver(&xps2_of_driver);
 }
 
 static void __exit xps2_cleanup(void)
 {
-	platform_driver_unregister(&xps2_of_driver);
+	of_unregister_platform_driver(&xps2_of_driver);
 }
 
 module_init(xps2_init);

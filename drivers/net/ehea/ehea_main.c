@@ -26,8 +26,6 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
 #include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
@@ -41,7 +39,6 @@
 #include <linux/memory.h>
 #include <asm/kexec.h>
 #include <linux/mutex.h>
-#include <linux/prefetch.h>
 
 #include <net/ip.h>
 
@@ -104,15 +101,16 @@ MODULE_PARM_DESC(use_lro, " Large Receive Offload, 1: enable, 0: disable, "
 static int port_name_cnt;
 static LIST_HEAD(adapter_list);
 static unsigned long ehea_driver_flags;
+struct work_struct ehea_rereg_mr_task;
 static DEFINE_MUTEX(dlpar_mem_lock);
 struct ehea_fw_handle_array ehea_fw_handles;
 struct ehea_bcmc_reg_array ehea_bcmc_regs;
 
 
-static int __devinit ehea_probe_adapter(struct platform_device *dev,
+static int __devinit ehea_probe_adapter(struct of_device *dev,
 					const struct of_device_id *id);
 
-static int __devexit ehea_remove(struct platform_device *dev);
+static int __devexit ehea_remove(struct of_device *dev);
 
 static struct of_device_id ehea_device_table[] = {
 	{
@@ -138,8 +136,8 @@ void ehea_dump(void *adr, int len, char *msg)
 	int x;
 	unsigned char *deb = adr;
 	for (x = 0; x < len; x += 16) {
-		pr_info("%s adr=%p ofs=%04x %016llx %016llx\n",
-			msg, deb, x, *((u64 *)&deb[0]), *((u64 *)&deb[8]));
+		printk(DRV_NAME " %s adr=%p ofs=%04x %016llx %016llx\n", msg,
+			  deb, x, *((u64 *)&deb[0]), *((u64 *)&deb[8]));
 		deb += 16;
 	}
 }
@@ -182,7 +180,7 @@ static void ehea_update_firmware_handles(void)
 			 num_portres * EHEA_NUM_PORTRES_FW_HANDLES;
 
 	if (num_fw_handles) {
-		arr = kcalloc(num_fw_handles, sizeof(*arr), GFP_KERNEL);
+		arr = kzalloc(num_fw_handles * sizeof(*arr), GFP_KERNEL);
 		if (!arr)
 			goto out;  /* Keep the existing array */
 	} else
@@ -267,7 +265,7 @@ static void ehea_update_bcmc_registrations(void)
 		}
 
 	if (num_registrations) {
-		arr = kcalloc(num_registrations, sizeof(*arr), GFP_ATOMIC);
+		arr = kzalloc(num_registrations * sizeof(*arr), GFP_ATOMIC);
 		if (!arr)
 			goto out;  /* Keep the existing array */
 	} else
@@ -332,14 +330,14 @@ static struct net_device_stats *ehea_get_stats(struct net_device *dev)
 	struct ehea_port *port = netdev_priv(dev);
 	struct net_device_stats *stats = &port->stats;
 	struct hcp_ehea_port_cb2 *cb2;
-	u64 hret, rx_packets, tx_packets, rx_bytes = 0, tx_bytes = 0;
+	u64 hret, rx_packets, tx_packets;
 	int i;
 
 	memset(stats, 0, sizeof(*stats));
 
-	cb2 = (void *)get_zeroed_page(GFP_KERNEL);
+	cb2 = (void *)get_zeroed_page(GFP_ATOMIC);
 	if (!cb2) {
-		netdev_err(dev, "no mem for cb2\n");
+		ehea_error("no mem for cb2");
 		goto out;
 	}
 
@@ -347,7 +345,7 @@ static struct net_device_stats *ehea_get_stats(struct net_device *dev)
 				      port->logical_port_id,
 				      H_PORT_CB2, H_PORT_CB2_ALL, cb2);
 	if (hret != H_SUCCESS) {
-		netdev_err(dev, "query_ehea_port failed\n");
+		ehea_error("query_ehea_port failed");
 		goto out_herr;
 	}
 
@@ -355,22 +353,18 @@ static struct net_device_stats *ehea_get_stats(struct net_device *dev)
 		ehea_dump(cb2, sizeof(*cb2), "net_device_stats");
 
 	rx_packets = 0;
-	for (i = 0; i < port->num_def_qps; i++) {
+	for (i = 0; i < port->num_def_qps; i++)
 		rx_packets += port->port_res[i].rx_packets;
-		rx_bytes   += port->port_res[i].rx_bytes;
-	}
 
 	tx_packets = 0;
-	for (i = 0; i < port->num_def_qps + port->num_add_tx_qps; i++) {
+	for (i = 0; i < port->num_def_qps + port->num_add_tx_qps; i++)
 		tx_packets += port->port_res[i].tx_packets;
-		tx_bytes   += port->port_res[i].tx_bytes;
-	}
 
 	stats->tx_packets = tx_packets;
 	stats->multicast = cb2->rxmcp;
 	stats->rx_errors = cb2->rxuerr;
-	stats->rx_bytes = rx_bytes;
-	stats->tx_bytes = tx_bytes;
+	stats->rx_bytes = cb2->rxo;
+	stats->tx_bytes = cb2->txo;
 	stats->rx_packets = rx_packets;
 
 out_herr:
@@ -402,7 +396,6 @@ static void ehea_refill_rq1(struct ehea_port_res *pr, int index, int nr_of_wqes)
 			skb_arr_rq1[index] = netdev_alloc_skb(dev,
 							      EHEA_L_PKT_SIZE);
 			if (!skb_arr_rq1[index]) {
-				netdev_info(dev, "Unable to allocate enough skb in the array\n");
 				pr->rq1_skba.os_skbs = fill_wqes - i;
 				break;
 			}
@@ -425,20 +418,13 @@ static void ehea_init_fill_rq1(struct ehea_port_res *pr, int nr_rq1a)
 	struct net_device *dev = pr->port->netdev;
 	int i;
 
-	if (nr_rq1a > pr->rq1_skba.len) {
-		netdev_err(dev, "NR_RQ1A bigger than skb array len\n");
-		return;
-	}
-
-	for (i = 0; i < nr_rq1a; i++) {
+	for (i = 0; i < pr->rq1_skba.len; i++) {
 		skb_arr_rq1[i] = netdev_alloc_skb(dev, EHEA_L_PKT_SIZE);
-		if (!skb_arr_rq1[i]) {
-			netdev_info(dev, "Not enough memory to allocate skb array\n");
+		if (!skb_arr_rq1[i])
 			break;
-		}
 	}
 	/* Ring doorbell */
-	ehea_update_rq1a(pr->qp, i - 1);
+	ehea_update_rq1a(pr->qp, nr_rq1a);
 }
 
 static int ehea_refill_rq_def(struct ehea_port_res *pr,
@@ -471,9 +457,8 @@ static int ehea_refill_rq_def(struct ehea_port_res *pr,
 		if (!skb) {
 			q_skba->os_skbs = fill_wqes - i;
 			if (q_skba->os_skbs == q_skba->len - 2) {
-				netdev_info(pr->port->netdev,
-					    "rq%i ran dry - no mem for skb\n",
-					    rq_nr);
+				ehea_info("%s: rq%i ran dry - no mem for skb",
+					  pr->port->netdev->name, rq_nr);
 				ret = -ENOMEM;
 			}
 			break;
@@ -548,15 +533,8 @@ static inline void ehea_fill_skb(struct net_device *dev,
 	int length = cqe->num_bytes_transfered - 4;	/*remove CRC */
 
 	skb_put(skb, length);
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	skb->protocol = eth_type_trans(skb, dev);
-
-	/* The packet was not an IPV4 packet so a complemented checksum was
-	   calculated. The value is found in the Internet Checksum field. */
-	if (cqe->status & EHEA_CQE_BLIND_CKSUM) {
-		skb->ip_summed = CHECKSUM_COMPLETE;
-		skb->csum = csum_unfold(~cqe->inet_checksum_value);
-	} else
-		skb->ip_summed = CHECKSUM_UNNECESSARY;
 }
 
 static inline struct sk_buff *get_skb_by_index(struct sk_buff **skb_array,
@@ -638,8 +616,8 @@ static int ehea_treat_poll_error(struct ehea_port_res *pr, int rq,
 
 	if (cqe->status & EHEA_CQE_STAT_FAT_ERR_MASK) {
 		if (netif_msg_rx_err(pr->port)) {
-			pr_err("Critical receive error for QP %d. Resetting port.\n",
-			       pr->qp->init_attr.qp_nr);
+			ehea_error("Critical receive error for QP %d. "
+				   "Resetting port.", pr->qp->init_attr.qp_nr);
 			ehea_dump(cqe, sizeof(*cqe), "CQE");
 		}
 		ehea_schedule_port_reset(pr->port);
@@ -686,7 +664,7 @@ static void ehea_proc_skb(struct ehea_port_res *pr, struct ehea_cqe *cqe,
 	int vlan_extracted = ((cqe->status & EHEA_CQE_VLAN_TAG_XTRACT) &&
 			      pr->port->vgrp);
 
-	if (skb->dev->features & NETIF_F_LRO) {
+	if (use_lro) {
 		if (vlan_extracted)
 			lro_vlan_hwaccel_receive_skb(&pr->lro_mgr, skb,
 						     pr->port->vgrp,
@@ -718,7 +696,6 @@ static int ehea_proc_rwqes(struct net_device *dev,
 	int skb_arr_rq2_len = pr->rq2_skba.len;
 	int skb_arr_rq3_len = pr->rq3_skba.len;
 	int processed, processed_rq1, processed_rq2, processed_rq3;
-	u64 processed_bytes = 0;
 	int wqe_index, last_wqe_index, rq, port_reset;
 
 	processed = processed_rq1 = processed_rq2 = processed_rq3 = 0;
@@ -741,15 +718,13 @@ static int ehea_proc_rwqes(struct net_device *dev,
 							  skb_arr_rq1_len,
 							  wqe_index);
 				if (unlikely(!skb)) {
-					netif_info(port, rx_err, dev,
-						  "LL rq1: skb=NULL\n");
+					if (netif_msg_rx_err(port))
+						ehea_error("LL rq1: skb=NULL");
 
 					skb = netdev_alloc_skb(dev,
 							       EHEA_L_PKT_SIZE);
-					if (!skb) {
-						netdev_err(dev, "Not enough memory to allocate skb\n");
+					if (!skb)
 						break;
-					}
 				}
 				skb_copy_to_linear_data(skb, ((char *)cqe) + 64,
 						 cqe->num_bytes_transfered - 4);
@@ -759,8 +734,8 @@ static int ehea_proc_rwqes(struct net_device *dev,
 				skb = get_skb_by_index(skb_arr_rq2,
 						       skb_arr_rq2_len, cqe);
 				if (unlikely(!skb)) {
-					netif_err(port, rx_err, dev,
-						  "rq2: skb=NULL\n");
+					if (netif_msg_rx_err(port))
+						ehea_error("rq2: skb=NULL");
 					break;
 				}
 				ehea_fill_skb(dev, skb, cqe);
@@ -770,15 +745,14 @@ static int ehea_proc_rwqes(struct net_device *dev,
 				skb = get_skb_by_index(skb_arr_rq3,
 						       skb_arr_rq3_len, cqe);
 				if (unlikely(!skb)) {
-					netif_err(port, rx_err, dev,
-						  "rq3: skb=NULL\n");
+					if (netif_msg_rx_err(port))
+						ehea_error("rq3: skb=NULL");
 					break;
 				}
 				ehea_fill_skb(dev, skb, cqe);
 				processed_rq3++;
 			}
 
-			processed_bytes += skb->len;
 			ehea_proc_skb(pr, cqe, skb);
 		} else {
 			pr->p_stats.poll_receive_errors++;
@@ -790,11 +764,10 @@ static int ehea_proc_rwqes(struct net_device *dev,
 		}
 		cqe = ehea_poll_rq1(qp, &wqe_index);
 	}
-	if (dev->features & NETIF_F_LRO)
+	if (use_lro)
 		lro_flush_all(&pr->lro_mgr);
 
 	pr->rx_packets += processed;
-	pr->rx_bytes += processed_bytes;
 
 	ehea_refill_rq1(pr, last_wqe_index, processed_rq1);
 	ehea_refill_rq2(pr, processed_rq2);
@@ -802,54 +775,6 @@ static int ehea_proc_rwqes(struct net_device *dev,
 
 	return processed;
 }
-
-#define SWQE_RESTART_CHECK 0xdeadbeaff00d0000ull
-
-static void reset_sq_restart_flag(struct ehea_port *port)
-{
-	int i;
-
-	for (i = 0; i < port->num_def_qps + port->num_add_tx_qps; i++) {
-		struct ehea_port_res *pr = &port->port_res[i];
-		pr->sq_restart_flag = 0;
-	}
-	wake_up(&port->restart_wq);
-}
-
-static void check_sqs(struct ehea_port *port)
-{
-	struct ehea_swqe *swqe;
-	int swqe_index;
-	int i, k;
-
-	for (i = 0; i < port->num_def_qps + port->num_add_tx_qps; i++) {
-		struct ehea_port_res *pr = &port->port_res[i];
-		int ret;
-		k = 0;
-		swqe = ehea_get_swqe(pr->qp, &swqe_index);
-		memset(swqe, 0, SWQE_HEADER_SIZE);
-		atomic_dec(&pr->swqe_avail);
-
-		swqe->tx_control |= EHEA_SWQE_PURGE;
-		swqe->wr_id = SWQE_RESTART_CHECK;
-		swqe->tx_control |= EHEA_SWQE_SIGNALLED_COMPLETION;
-		swqe->tx_control |= EHEA_SWQE_IMM_DATA_PRESENT;
-		swqe->immediate_data_length = 80;
-
-		ehea_post_swqe(pr->qp, swqe);
-
-		ret = wait_event_timeout(port->restart_wq,
-					 pr->sq_restart_flag == 0,
-					 msecs_to_jiffies(100));
-
-		if (!ret) {
-			pr_err("HW/SW queues out of sync\n");
-			ehea_schedule_port_reset(pr->port);
-			return;
-		}
-	}
-}
-
 
 static struct ehea_cqe *ehea_proc_cqes(struct ehea_port_res *pr, int my_quota)
 {
@@ -868,22 +793,15 @@ static struct ehea_cqe *ehea_proc_cqes(struct ehea_port_res *pr, int my_quota)
 
 		cqe_counter++;
 		rmb();
-
-		if (cqe->wr_id == SWQE_RESTART_CHECK) {
-			pr->sq_restart_flag = 1;
-			swqe_av++;
-			break;
-		}
-
 		if (cqe->status & EHEA_CQE_STAT_ERR_MASK) {
-			pr_err("Bad send completion status=0x%04X\n",
-			       cqe->status);
+			ehea_error("Bad send completion status=0x%04X",
+				   cqe->status);
 
 			if (netif_msg_tx_err(pr->port))
 				ehea_dump(cqe, sizeof(*cqe), "Send CQE");
 
 			if (cqe->status & EHEA_CQE_STAT_RESET_MASK) {
-				pr_err("Resetting port\n");
+				ehea_error("Resetting port");
 				ehea_schedule_port_reset(pr->port);
 				break;
 			}
@@ -918,7 +836,6 @@ static struct ehea_cqe *ehea_proc_cqes(struct ehea_port_res *pr, int my_quota)
 		pr->queue_stopped = 0;
 	}
 	spin_unlock_irqrestore(&pr->netif_queue, flags);
-	wake_up(&pr->port->swqe_avail_wq);
 
 	return cqe;
 }
@@ -1001,8 +918,8 @@ static irqreturn_t ehea_qp_aff_irq_handler(int irq, void *param)
 
 	while (eqe) {
 		qp_token = EHEA_BMASK_GET(EHEA_EQE_QP_TOKEN, eqe->entry);
-		pr_err("QP aff_err: entry=0x%llx, token=0x%x\n",
-		       eqe->entry, qp_token);
+		ehea_error("QP aff_err: entry=0x%llx, token=0x%x",
+			   eqe->entry, qp_token);
 
 		qp = port->port_res[qp_token].qp;
 
@@ -1020,7 +937,7 @@ static irqreturn_t ehea_qp_aff_irq_handler(int irq, void *param)
 	}
 
 	if (reset_port) {
-		pr_err("Resetting port\n");
+		ehea_error("Resetting port");
 		ehea_schedule_port_reset(port);
 	}
 
@@ -1048,7 +965,7 @@ int ehea_sense_port_attr(struct ehea_port *port)
 	/* may be called via ehea_neq_tasklet() */
 	cb0 = (void *)get_zeroed_page(GFP_ATOMIC);
 	if (!cb0) {
-		pr_err("no mem for cb0\n");
+		ehea_error("no mem for cb0");
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -1140,7 +1057,7 @@ int ehea_set_portspeed(struct ehea_port *port, u32 port_speed)
 
 	cb4 = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!cb4) {
-		pr_err("no mem for cb4\n");
+		ehea_error("no mem for cb4");
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -1191,16 +1108,16 @@ int ehea_set_portspeed(struct ehea_port *port, u32 port_speed)
 				break;
 			}
 		} else {
-			pr_err("Failed sensing port speed\n");
+			ehea_error("Failed sensing port speed");
 			ret = -EIO;
 		}
 	} else {
 		if (hret == H_AUTHORITY) {
-			pr_info("Hypervisor denied setting port speed\n");
+			ehea_info("Hypervisor denied setting port speed");
 			ret = -EPERM;
 		} else {
 			ret = -EIO;
-			pr_err("Failed setting port speed\n");
+			ehea_error("Failed setting port speed");
 		}
 	}
 	if (!prop_carrier_state || (port->phy_link == EHEA_PHY_LINK_UP))
@@ -1217,78 +1134,80 @@ static void ehea_parse_eqe(struct ehea_adapter *adapter, u64 eqe)
 	u8 ec;
 	u8 portnum;
 	struct ehea_port *port;
-	struct net_device *dev;
 
 	ec = EHEA_BMASK_GET(NEQE_EVENT_CODE, eqe);
 	portnum = EHEA_BMASK_GET(NEQE_PORTNUM, eqe);
 	port = ehea_get_port(adapter, portnum);
-	dev = port->netdev;
 
 	switch (ec) {
 	case EHEA_EC_PORTSTATE_CHG:	/* port state change */
 
 		if (!port) {
-			netdev_err(dev, "unknown portnum %x\n", portnum);
+			ehea_error("unknown portnum %x", portnum);
 			break;
 		}
 
 		if (EHEA_BMASK_GET(NEQE_PORT_UP, eqe)) {
-			if (!netif_carrier_ok(dev)) {
+			if (!netif_carrier_ok(port->netdev)) {
 				ret = ehea_sense_port_attr(port);
 				if (ret) {
-					netdev_err(dev, "failed resensing port attributes\n");
+					ehea_error("failed resensing port "
+						   "attributes");
 					break;
 				}
 
-				netif_info(port, link, dev,
-					   "Logical port up: %dMbps %s Duplex\n",
-					   port->port_speed,
-					   port->full_duplex == 1 ?
-					   "Full" : "Half");
+				if (netif_msg_link(port))
+					ehea_info("%s: Logical port up: %dMbps "
+						  "%s Duplex",
+						  port->netdev->name,
+						  port->port_speed,
+						  port->full_duplex ==
+						  1 ? "Full" : "Half");
 
-				netif_carrier_on(dev);
-				netif_wake_queue(dev);
+				netif_carrier_on(port->netdev);
+				netif_wake_queue(port->netdev);
 			}
 		} else
-			if (netif_carrier_ok(dev)) {
-				netif_info(port, link, dev,
-					   "Logical port down\n");
-				netif_carrier_off(dev);
-				netif_stop_queue(dev);
+			if (netif_carrier_ok(port->netdev)) {
+				if (netif_msg_link(port))
+					ehea_info("%s: Logical port down",
+						  port->netdev->name);
+				netif_carrier_off(port->netdev);
+				netif_stop_queue(port->netdev);
 			}
 
 		if (EHEA_BMASK_GET(NEQE_EXTSWITCH_PORT_UP, eqe)) {
 			port->phy_link = EHEA_PHY_LINK_UP;
-			netif_info(port, link, dev,
-				   "Physical port up\n");
+			if (netif_msg_link(port))
+				ehea_info("%s: Physical port up",
+					  port->netdev->name);
 			if (prop_carrier_state)
-				netif_carrier_on(dev);
+				netif_carrier_on(port->netdev);
 		} else {
 			port->phy_link = EHEA_PHY_LINK_DOWN;
-			netif_info(port, link, dev,
-				   "Physical port down\n");
+			if (netif_msg_link(port))
+				ehea_info("%s: Physical port down",
+					  port->netdev->name);
 			if (prop_carrier_state)
-				netif_carrier_off(dev);
+				netif_carrier_off(port->netdev);
 		}
 
 		if (EHEA_BMASK_GET(NEQE_EXTSWITCH_PRIMARY, eqe))
-			netdev_info(dev,
-				    "External switch port is primary port\n");
+			ehea_info("External switch port is primary port");
 		else
-			netdev_info(dev,
-				    "External switch port is backup port\n");
+			ehea_info("External switch port is backup port");
 
 		break;
 	case EHEA_EC_ADAPTER_MALFUNC:
-		netdev_err(dev, "Adapter malfunction\n");
+		ehea_error("Adapter malfunction");
 		break;
 	case EHEA_EC_PORT_MALFUNC:
-		netdev_info(dev, "Port malfunction\n");
-		netif_carrier_off(dev);
-		netif_stop_queue(dev);
+		ehea_info("Port malfunction: Device: %s", port->netdev->name);
+		netif_carrier_off(port->netdev);
+		netif_stop_queue(port->netdev);
 		break;
 	default:
-		netdev_err(dev, "unknown event code %x, eqe=0x%llX\n", ec, eqe);
+		ehea_error("unknown event code %x, eqe=0x%llX", ec, eqe);
 		break;
 	}
 }
@@ -1300,13 +1219,13 @@ static void ehea_neq_tasklet(unsigned long data)
 	u64 event_mask;
 
 	eqe = ehea_poll_eq(adapter->neq);
-	pr_debug("eqe=%p\n", eqe);
+	ehea_debug("eqe=%p", eqe);
 
 	while (eqe) {
-		pr_debug("*eqe=%lx\n", (unsigned long) eqe->entry);
+		ehea_debug("*eqe=%lx", eqe->entry);
 		ehea_parse_eqe(adapter, eqe->entry);
 		eqe = ehea_poll_eq(adapter->neq);
-		pr_debug("next eqe=%p\n", eqe);
+		ehea_debug("next eqe=%p", eqe);
 	}
 
 	event_mask = EHEA_BMASK_SET(NELR_PORTSTATE_CHG, 1)
@@ -1330,7 +1249,9 @@ static int ehea_fill_port_res(struct ehea_port_res *pr)
 	int ret;
 	struct ehea_qp_init_attr *init_attr = &pr->qp->init_attr;
 
-	ehea_init_fill_rq1(pr, pr->rq1_skba.len);
+	ehea_init_fill_rq1(pr, init_attr->act_nr_rwqes_rq1
+			       - init_attr->act_nr_rwqes_rq2
+			       - init_attr->act_nr_rwqes_rq3 - 1);
 
 	ret = ehea_refill_rq2(pr, init_attr->act_nr_rwqes_rq2 - 1);
 
@@ -1353,14 +1274,14 @@ static int ehea_reg_interrupts(struct net_device *dev)
 				  ehea_qp_aff_irq_handler,
 				  IRQF_DISABLED, port->int_aff_name, port);
 	if (ret) {
-		netdev_err(dev, "failed registering irq for qp_aff_irq_handler:ist=%X\n",
-			   port->qp_eq->attr.ist1);
+		ehea_error("failed registering irq for qp_aff_irq_handler:"
+			   "ist=%X", port->qp_eq->attr.ist1);
 		goto out_free_qpeq;
 	}
 
-	netif_info(port, ifup, dev,
-		   "irq_handle 0x%X for function qp_aff_irq_handler registered\n",
-		   port->qp_eq->attr.ist1);
+	if (netif_msg_ifup(port))
+		ehea_info("irq_handle 0x%X for function qp_aff_irq_handler "
+			  "registered", port->qp_eq->attr.ist1);
 
 
 	for (i = 0; i < port->num_def_qps + port->num_add_tx_qps; i++) {
@@ -1372,13 +1293,14 @@ static int ehea_reg_interrupts(struct net_device *dev)
 					  IRQF_DISABLED, pr->int_send_name,
 					  pr);
 		if (ret) {
-			netdev_err(dev, "failed registering irq for ehea_queue port_res_nr:%d, ist=%X\n",
-				   i, pr->eq->attr.ist1);
+			ehea_error("failed registering irq for ehea_queue "
+				   "port_res_nr:%d, ist=%X", i,
+				   pr->eq->attr.ist1);
 			goto out_free_req;
 		}
-		netif_info(port, ifup, dev,
-			   "irq_handle 0x%X for function ehea_queue_int %d registered\n",
-			   pr->eq->attr.ist1, i);
+		if (netif_msg_ifup(port))
+			ehea_info("irq_handle 0x%X for function ehea_queue_int "
+				  "%d registered", pr->eq->attr.ist1, i);
 	}
 out:
 	return ret;
@@ -1409,16 +1331,16 @@ static void ehea_free_interrupts(struct net_device *dev)
 	for (i = 0; i < port->num_def_qps + port->num_add_tx_qps; i++) {
 		pr = &port->port_res[i];
 		ibmebus_free_irq(pr->eq->attr.ist1, pr);
-		netif_info(port, intr, dev,
-			   "free send irq for res %d with handle 0x%X\n",
-			   i, pr->eq->attr.ist1);
+		if (netif_msg_intr(port))
+			ehea_info("free send irq for res %d with handle 0x%X",
+				  i, pr->eq->attr.ist1);
 	}
 
 	/* associated events */
 	ibmebus_free_irq(port->qp_eq->attr.ist1, port);
-	netif_info(port, intr, dev,
-		   "associated event interrupt for handle 0x%X freed\n",
-		   port->qp_eq->attr.ist1);
+	if (netif_msg_intr(port))
+		ehea_info("associated event interrupt for handle 0x%X freed",
+			  port->qp_eq->attr.ist1);
 }
 
 static int ehea_configure_port(struct ehea_port *port)
@@ -1487,7 +1409,7 @@ int ehea_gen_smrs(struct ehea_port_res *pr)
 out_free:
 	ehea_rem_mr(&pr->send_mr);
 out:
-	pr_err("Generating SMRS failed\n");
+	ehea_error("Generating SMRS failed\n");
 	return -EIO;
 }
 
@@ -1504,9 +1426,11 @@ static int ehea_init_q_skba(struct ehea_q_skb_arr *q_skba, int max_q_entries)
 {
 	int arr_size = sizeof(void *) * max_q_entries;
 
-	q_skba->arr = vzalloc(arr_size);
+	q_skba->arr = vmalloc(arr_size);
 	if (!q_skba->arr)
 		return -ENOMEM;
+
+	memset(q_skba->arr, 0, arr_size);
 
 	q_skba->len = max_q_entries;
 	q_skba->index = 0;
@@ -1522,19 +1446,8 @@ static int ehea_init_port_res(struct ehea_port *port, struct ehea_port_res *pr,
 	enum ehea_eq_type eq_type = EHEA_EQ;
 	struct ehea_qp_init_attr *init_attr = NULL;
 	int ret = -EIO;
-	u64 tx_bytes, rx_bytes, tx_packets, rx_packets;
-
-	tx_bytes = pr->tx_bytes;
-	tx_packets = pr->tx_packets;
-	rx_bytes = pr->rx_bytes;
-	rx_packets = pr->rx_packets;
 
 	memset(pr, 0, sizeof(struct ehea_port_res));
-
-	pr->tx_bytes = rx_bytes;
-	pr->tx_packets = tx_packets;
-	pr->rx_bytes = rx_bytes;
-	pr->rx_packets = rx_packets;
 
 	pr->port = port;
 	spin_lock_init(&pr->xmit_lock);
@@ -1542,7 +1455,7 @@ static int ehea_init_port_res(struct ehea_port *port, struct ehea_port_res *pr,
 
 	pr->eq = ehea_create_eq(adapter, eq_type, EHEA_MAX_ENTRIES_EQ, 0);
 	if (!pr->eq) {
-		pr_err("create_eq failed (eq)\n");
+		ehea_error("create_eq failed (eq)");
 		goto out_free;
 	}
 
@@ -1550,7 +1463,7 @@ static int ehea_init_port_res(struct ehea_port *port, struct ehea_port_res *pr,
 				     pr->eq->fw_handle,
 				     port->logical_port_id);
 	if (!pr->recv_cq) {
-		pr_err("create_cq failed (cq_recv)\n");
+		ehea_error("create_cq failed (cq_recv)");
 		goto out_free;
 	}
 
@@ -1558,19 +1471,19 @@ static int ehea_init_port_res(struct ehea_port *port, struct ehea_port_res *pr,
 				     pr->eq->fw_handle,
 				     port->logical_port_id);
 	if (!pr->send_cq) {
-		pr_err("create_cq failed (cq_send)\n");
+		ehea_error("create_cq failed (cq_send)");
 		goto out_free;
 	}
 
 	if (netif_msg_ifup(port))
-		pr_info("Send CQ: act_nr_cqes=%d, Recv CQ: act_nr_cqes=%d\n",
-			pr->send_cq->attr.act_nr_of_cqes,
-			pr->recv_cq->attr.act_nr_of_cqes);
+		ehea_info("Send CQ: act_nr_cqes=%d, Recv CQ: act_nr_cqes=%d",
+			  pr->send_cq->attr.act_nr_of_cqes,
+			  pr->recv_cq->attr.act_nr_of_cqes);
 
 	init_attr = kzalloc(sizeof(*init_attr), GFP_KERNEL);
 	if (!init_attr) {
 		ret = -ENOMEM;
-		pr_err("no mem for ehea_qp_init_attr\n");
+		ehea_error("no mem for ehea_qp_init_attr");
 		goto out_free;
 	}
 
@@ -1595,18 +1508,18 @@ static int ehea_init_port_res(struct ehea_port *port, struct ehea_port_res *pr,
 
 	pr->qp = ehea_create_qp(adapter, adapter->pd, init_attr);
 	if (!pr->qp) {
-		pr_err("create_qp failed\n");
+		ehea_error("create_qp failed");
 		ret = -EIO;
 		goto out_free;
 	}
 
 	if (netif_msg_ifup(port))
-		pr_info("QP: qp_nr=%d\n act_nr_snd_wqe=%d\n nr_rwqe_rq1=%d\n nr_rwqe_rq2=%d\n nr_rwqe_rq3=%d\n",
-			init_attr->qp_nr,
-			init_attr->act_nr_send_wqes,
-			init_attr->act_nr_rwqes_rq1,
-			init_attr->act_nr_rwqes_rq2,
-			init_attr->act_nr_rwqes_rq3);
+		ehea_info("QP: qp_nr=%d\n act_nr_snd_wqe=%d\n nr_rwqe_rq1=%d\n "
+			  "nr_rwqe_rq2=%d\n nr_rwqe_rq3=%d", init_attr->qp_nr,
+			  init_attr->act_nr_send_wqes,
+			  init_attr->act_nr_rwqes_rq1,
+			  init_attr->act_nr_rwqes_rq2,
+			  init_attr->act_nr_rwqes_rq3);
 
 	pr->sq_skba_size = init_attr->act_nr_send_wqes + 1;
 
@@ -1757,7 +1670,7 @@ static void write_swqe2_TSO(struct sk_buff *skb,
 			swqe->descriptors++;
 		}
 	} else
-		pr_err("cannot handle fragmented headers\n");
+		ehea_error("cannot handle fragmented headers");
 }
 
 static void write_swqe2_nonTSO(struct sk_buff *skb,
@@ -1853,8 +1766,8 @@ static int ehea_broadcast_reg_helper(struct ehea_port *port, u32 hcallid)
 				     port->logical_port_id,
 				     reg_type, port->mac_addr, 0, hcallid);
 	if (hret != H_SUCCESS) {
-		pr_err("%sregistering bc address failed (tagged)\n",
-		       hcallid == H_REG_BCMC ? "" : "de");
+		ehea_error("%sregistering bc address failed (tagged)",
+			   hcallid == H_REG_BCMC ? "" : "de");
 		ret = -EIO;
 		goto out_herr;
 	}
@@ -1865,8 +1778,8 @@ static int ehea_broadcast_reg_helper(struct ehea_port *port, u32 hcallid)
 				     port->logical_port_id,
 				     reg_type, port->mac_addr, 0, hcallid);
 	if (hret != H_SUCCESS) {
-		pr_err("%sregistering bc address failed (vlan)\n",
-		       hcallid == H_REG_BCMC ? "" : "de");
+		ehea_error("%sregistering bc address failed (vlan)",
+			   hcallid == H_REG_BCMC ? "" : "de");
 		ret = -EIO;
 	}
 out_herr:
@@ -1888,7 +1801,7 @@ static int ehea_set_mac_addr(struct net_device *dev, void *sa)
 
 	cb0 = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!cb0) {
-		pr_err("no mem for cb0\n");
+		ehea_error("no mem for cb0");
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -1936,11 +1849,11 @@ out:
 static void ehea_promiscuous_error(u64 hret, int enable)
 {
 	if (hret == H_AUTHORITY)
-		pr_info("Hypervisor denied %sabling promiscuous mode\n",
-			enable == 1 ? "en" : "dis");
+		ehea_info("Hypervisor denied %sabling promiscuous mode",
+			  enable == 1 ? "en" : "dis");
 	else
-		pr_err("failed %sabling promiscuous mode\n",
-		       enable == 1 ? "en" : "dis");
+		ehea_error("failed %sabling promiscuous mode",
+			   enable == 1 ? "en" : "dis");
 }
 
 static void ehea_promiscuous(struct net_device *dev, int enable)
@@ -1949,12 +1862,12 @@ static void ehea_promiscuous(struct net_device *dev, int enable)
 	struct hcp_ehea_port_cb7 *cb7;
 	u64 hret;
 
-	if (enable == port->promisc)
+	if ((enable && port->promisc) || (!enable && !port->promisc))
 		return;
 
 	cb7 = (void *)get_zeroed_page(GFP_ATOMIC);
 	if (!cb7) {
-		pr_err("no mem for cb7\n");
+		ehea_error("no mem for cb7");
 		goto out;
 	}
 
@@ -2014,7 +1927,7 @@ static int ehea_drop_multicast_list(struct net_device *dev)
 		hret = ehea_multicast_reg_helper(port, mc_entry->macaddr,
 						 H_DEREG_BCMC);
 		if (hret) {
-			pr_err("failed deregistering mcast MAC\n");
+			ehea_error("failed deregistering mcast MAC");
 			ret = -EIO;
 		}
 
@@ -2037,8 +1950,7 @@ static void ehea_allmulti(struct net_device *dev, int enable)
 			if (!hret)
 				port->allmulti = 1;
 			else
-				netdev_err(dev,
-					   "failed enabling IFF_ALLMULTI\n");
+				ehea_error("failed enabling IFF_ALLMULTI");
 		}
 	} else
 		if (!enable) {
@@ -2047,8 +1959,7 @@ static void ehea_allmulti(struct net_device *dev, int enable)
 			if (!hret)
 				port->allmulti = 0;
 			else
-				netdev_err(dev,
-					   "failed disabling IFF_ALLMULTI\n");
+				ehea_error("failed disabling IFF_ALLMULTI");
 		}
 }
 
@@ -2059,7 +1970,7 @@ static void ehea_add_multicast_entry(struct ehea_port *port, u8 *mc_mac_addr)
 
 	ehea_mcl_entry = kzalloc(sizeof(*ehea_mcl_entry), GFP_ATOMIC);
 	if (!ehea_mcl_entry) {
-		pr_err("no mem for mcl_entry\n");
+		ehea_error("no mem for mcl_entry");
 		return;
 	}
 
@@ -2072,7 +1983,7 @@ static void ehea_add_multicast_entry(struct ehea_port *port, u8 *mc_mac_addr)
 	if (!hret)
 		list_add(&ehea_mcl_entry->list, &port->mc_list->list);
 	else {
-		pr_err("failed registering mcast MAC\n");
+		ehea_error("failed registering mcast MAC");
 		kfree(ehea_mcl_entry);
 	}
 }
@@ -2083,7 +1994,7 @@ static void ehea_set_multicast_list(struct net_device *dev)
 	struct netdev_hw_addr *ha;
 	int ret;
 
-	if (port->promisc) {
+	if (dev->flags & IFF_PROMISC) {
 		ehea_promiscuous(dev, 1);
 		return;
 	}
@@ -2105,8 +2016,9 @@ static void ehea_set_multicast_list(struct net_device *dev)
 		}
 
 		if (netdev_mc_count(dev) > port->adapter->max_mc_mac) {
-			pr_info("Mcast registration limit reached (0x%llx). Use ALLMULTI!\n",
-				port->adapter->max_mc_mac);
+			ehea_info("Mcast registration limit reached (0x%llx). "
+				  "Use ALLMULTI!",
+				  port->adapter->max_mc_mac);
 			goto out;
 		}
 
@@ -2274,14 +2186,6 @@ static int ehea_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	memset(swqe, 0, SWQE_HEADER_SIZE);
 	atomic_dec(&pr->swqe_avail);
 
-	if (vlan_tx_tag_present(skb)) {
-		swqe->tx_control |= EHEA_SWQE_VLAN_INSERT;
-		swqe->vlan_tag = vlan_tx_tag_get(skb);
-	}
-
-	pr->tx_packets++;
-	pr->tx_bytes += skb->len;
-
 	if (skb->len <= SWQE3_MAX_IMM) {
 		u32 sig_iv = port->sig_comp_iv;
 		u32 swqe_num = pr->swqe_id_counter;
@@ -2312,10 +2216,15 @@ static int ehea_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 	pr->swqe_id_counter += 1;
 
-	netif_info(port, tx_queued, dev,
-		   "post swqe on QP %d\n", pr->qp->init_attr.qp_nr);
-	if (netif_msg_tx_queued(port))
+	if (port->vgrp && vlan_tx_tag_present(skb)) {
+		swqe->tx_control |= EHEA_SWQE_VLAN_INSERT;
+		swqe->vlan_tag = vlan_tx_tag_get(skb);
+	}
+
+	if (netif_msg_tx_queued(port)) {
+		ehea_info("post swqe on QP %d", pr->qp->init_attr.qp_nr);
 		ehea_dump(swqe, 512, "swqe");
+	}
 
 	if (unlikely(test_bit(__EHEA_STOP_XFER, &ehea_driver_flags))) {
 		netif_stop_queue(dev);
@@ -2323,6 +2232,7 @@ static int ehea_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	ehea_post_swqe(pr->qp, swqe);
+	pr->tx_packets++;
 
 	if (unlikely(atomic_read(&pr->swqe_avail) <= 1)) {
 		spin_lock_irqsave(&pr->netif_queue, flags);
@@ -2351,14 +2261,14 @@ static void ehea_vlan_rx_register(struct net_device *dev,
 
 	cb1 = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!cb1) {
-		pr_err("no mem for cb1\n");
+		ehea_error("no mem for cb1");
 		goto out;
 	}
 
 	hret = ehea_h_modify_ehea_port(adapter->handle, port->logical_port_id,
 				       H_PORT_CB1, H_PORT_CB1_ALL, cb1);
 	if (hret != H_SUCCESS)
-		pr_err("modify_ehea_port failed\n");
+		ehea_error("modify_ehea_port failed");
 
 	free_page((unsigned long)cb1);
 out:
@@ -2375,14 +2285,14 @@ static void ehea_vlan_rx_add_vid(struct net_device *dev, unsigned short vid)
 
 	cb1 = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!cb1) {
-		pr_err("no mem for cb1\n");
+		ehea_error("no mem for cb1");
 		goto out;
 	}
 
 	hret = ehea_h_query_ehea_port(adapter->handle, port->logical_port_id,
 				      H_PORT_CB1, H_PORT_CB1_ALL, cb1);
 	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_port failed\n");
+		ehea_error("query_ehea_port failed");
 		goto out;
 	}
 
@@ -2392,7 +2302,7 @@ static void ehea_vlan_rx_add_vid(struct net_device *dev, unsigned short vid)
 	hret = ehea_h_modify_ehea_port(adapter->handle, port->logical_port_id,
 				       H_PORT_CB1, H_PORT_CB1_ALL, cb1);
 	if (hret != H_SUCCESS)
-		pr_err("modify_ehea_port failed\n");
+		ehea_error("modify_ehea_port failed");
 out:
 	free_page((unsigned long)cb1);
 	return;
@@ -2410,14 +2320,14 @@ static void ehea_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
 
 	cb1 = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!cb1) {
-		pr_err("no mem for cb1\n");
+		ehea_error("no mem for cb1");
 		goto out;
 	}
 
 	hret = ehea_h_query_ehea_port(adapter->handle, port->logical_port_id,
 				      H_PORT_CB1, H_PORT_CB1_ALL, cb1);
 	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_port failed\n");
+		ehea_error("query_ehea_port failed");
 		goto out;
 	}
 
@@ -2427,7 +2337,7 @@ static void ehea_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
 	hret = ehea_h_modify_ehea_port(adapter->handle, port->logical_port_id,
 				       H_PORT_CB1, H_PORT_CB1_ALL, cb1);
 	if (hret != H_SUCCESS)
-		pr_err("modify_ehea_port failed\n");
+		ehea_error("modify_ehea_port failed");
 out:
 	free_page((unsigned long)cb1);
 }
@@ -2449,7 +2359,7 @@ int ehea_activate_qp(struct ehea_adapter *adapter, struct ehea_qp *qp)
 	hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
 				    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF), cb0);
 	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_qp failed (1)\n");
+		ehea_error("query_ehea_qp failed (1)");
 		goto out;
 	}
 
@@ -2458,14 +2368,14 @@ int ehea_activate_qp(struct ehea_adapter *adapter, struct ehea_qp *qp)
 				     EHEA_BMASK_SET(H_QPCB0_QP_CTL_REG, 1), cb0,
 				     &dummy64, &dummy64, &dummy16, &dummy16);
 	if (hret != H_SUCCESS) {
-		pr_err("modify_ehea_qp failed (1)\n");
+		ehea_error("modify_ehea_qp failed (1)");
 		goto out;
 	}
 
 	hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
 				    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF), cb0);
 	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_qp failed (2)\n");
+		ehea_error("query_ehea_qp failed (2)");
 		goto out;
 	}
 
@@ -2474,14 +2384,14 @@ int ehea_activate_qp(struct ehea_adapter *adapter, struct ehea_qp *qp)
 				     EHEA_BMASK_SET(H_QPCB0_QP_CTL_REG, 1), cb0,
 				     &dummy64, &dummy64, &dummy16, &dummy16);
 	if (hret != H_SUCCESS) {
-		pr_err("modify_ehea_qp failed (2)\n");
+		ehea_error("modify_ehea_qp failed (2)");
 		goto out;
 	}
 
 	hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
 				    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF), cb0);
 	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_qp failed (3)\n");
+		ehea_error("query_ehea_qp failed (3)");
 		goto out;
 	}
 
@@ -2490,14 +2400,14 @@ int ehea_activate_qp(struct ehea_adapter *adapter, struct ehea_qp *qp)
 				     EHEA_BMASK_SET(H_QPCB0_QP_CTL_REG, 1), cb0,
 				     &dummy64, &dummy64, &dummy16, &dummy16);
 	if (hret != H_SUCCESS) {
-		pr_err("modify_ehea_qp failed (3)\n");
+		ehea_error("modify_ehea_qp failed (3)");
 		goto out;
 	}
 
 	hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
 				    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF), cb0);
 	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_qp failed (4)\n");
+		ehea_error("query_ehea_qp failed (4)");
 		goto out;
 	}
 
@@ -2518,7 +2428,7 @@ static int ehea_port_res_setup(struct ehea_port *port, int def_qps,
 				   EHEA_MAX_ENTRIES_EQ, 1);
 	if (!port->qp_eq) {
 		ret = -EINVAL;
-		pr_err("ehea_create_eq failed (qp_eq)\n");
+		ehea_error("ehea_create_eq failed (qp_eq)");
 		goto out_kill_eq;
 	}
 
@@ -2599,27 +2509,27 @@ static int ehea_up(struct net_device *dev)
 	ret = ehea_port_res_setup(port, port->num_def_qps,
 				  port->num_add_tx_qps);
 	if (ret) {
-		netdev_err(dev, "port_res_failed\n");
+		ehea_error("port_res_failed");
 		goto out;
 	}
 
 	/* Set default QP for this port */
 	ret = ehea_configure_port(port);
 	if (ret) {
-		netdev_err(dev, "ehea_configure_port failed. ret:%d\n", ret);
+		ehea_error("ehea_configure_port failed. ret:%d", ret);
 		goto out_clean_pr;
 	}
 
 	ret = ehea_reg_interrupts(dev);
 	if (ret) {
-		netdev_err(dev, "reg_interrupts failed. ret:%d\n", ret);
+		ehea_error("reg_interrupts failed. ret:%d", ret);
 		goto out_clean_pr;
 	}
 
 	for (i = 0; i < port->num_def_qps + port->num_add_tx_qps; i++) {
 		ret = ehea_activate_qp(port->adapter, port->port_res[i].qp);
 		if (ret) {
-			netdev_err(dev, "activate_qp failed\n");
+			ehea_error("activate_qp failed");
 			goto out_free_irqs;
 		}
 	}
@@ -2627,7 +2537,7 @@ static int ehea_up(struct net_device *dev)
 	for (i = 0; i < port->num_def_qps; i++) {
 		ret = ehea_fill_port_res(&port->port_res[i]);
 		if (ret) {
-			netdev_err(dev, "out_free_irqs\n");
+			ehea_error("out_free_irqs");
 			goto out_free_irqs;
 		}
 	}
@@ -2650,7 +2560,7 @@ out_clean_pr:
 	ehea_clean_all_portres(port);
 out:
 	if (ret)
-		netdev_info(dev, "Failed starting. ret=%i\n", ret);
+		ehea_info("Failed starting %s. ret=%i", dev->name, ret);
 
 	ehea_update_bcmc_registrations();
 	ehea_update_firmware_handles();
@@ -2681,7 +2591,8 @@ static int ehea_open(struct net_device *dev)
 
 	mutex_lock(&port->port_lock);
 
-	netif_info(port, ifup, dev, "enabling port\n");
+	if (netif_msg_ifup(port))
+		ehea_info("enabling port %s", dev->name);
 
 	ret = ehea_up(dev);
 	if (!ret) {
@@ -2713,7 +2624,8 @@ static int ehea_down(struct net_device *dev)
 
 	ret = ehea_clean_all_portres(port);
 	if (ret)
-		netdev_info(dev, "Failed freeing resources. ret=%i\n", ret);
+		ehea_info("Failed freeing resources for %s. ret=%i",
+			  dev->name, ret);
 
 	ehea_update_firmware_handles();
 
@@ -2725,7 +2637,8 @@ static int ehea_stop(struct net_device *dev)
 	int ret;
 	struct ehea_port *port = netdev_priv(dev);
 
-	netif_info(port, ifdown, dev, "disabling port\n");
+	if (netif_msg_ifdown(port))
+		ehea_info("disabling port %s", dev->name);
 
 	set_bit(__EHEA_DISABLE_PORT_RESET, &port->flags);
 	cancel_work_sync(&port->reset_task);
@@ -2759,15 +2672,11 @@ static void ehea_flush_sq(struct ehea_port *port)
 	for (i = 0; i < port->num_def_qps + port->num_add_tx_qps; i++) {
 		struct ehea_port_res *pr = &port->port_res[i];
 		int swqe_max = pr->sq_skba_size - 2 - pr->swqe_ll_count;
-		int ret;
-
-		ret = wait_event_timeout(port->swqe_avail_wq,
-			 atomic_read(&pr->swqe_avail) >= swqe_max,
-			 msecs_to_jiffies(100));
-
-		if (!ret) {
-			pr_err("WARNING: sq not flushed completely\n");
-			break;
+		int k = 0;
+		while (atomic_read(&pr->swqe_avail) < swqe_max) {
+			msleep(5);
+			if (++k == 20)
+				break;
 		}
 	}
 }
@@ -2802,7 +2711,7 @@ int ehea_stop_qps(struct net_device *dev)
 					    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF),
 					    cb0);
 		if (hret != H_SUCCESS) {
-			pr_err("query_ehea_qp failed (1)\n");
+			ehea_error("query_ehea_qp failed (1)");
 			goto out;
 		}
 
@@ -2814,7 +2723,7 @@ int ehea_stop_qps(struct net_device *dev)
 							    1), cb0, &dummy64,
 					     &dummy64, &dummy16, &dummy16);
 		if (hret != H_SUCCESS) {
-			pr_err("modify_ehea_qp failed (1)\n");
+			ehea_error("modify_ehea_qp failed (1)");
 			goto out;
 		}
 
@@ -2822,14 +2731,14 @@ int ehea_stop_qps(struct net_device *dev)
 					    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF),
 					    cb0);
 		if (hret != H_SUCCESS) {
-			pr_err("query_ehea_qp failed (2)\n");
+			ehea_error("query_ehea_qp failed (2)");
 			goto out;
 		}
 
 		/* deregister shared memory regions */
 		dret = ehea_rem_smrs(pr);
 		if (dret) {
-			pr_err("unreg shared memory region failed\n");
+			ehea_error("unreg shared memory region failed");
 			goto out;
 		}
 	}
@@ -2898,7 +2807,7 @@ int ehea_restart_qps(struct net_device *dev)
 
 		ret = ehea_gen_smrs(pr);
 		if (ret) {
-			netdev_err(dev, "creation of shared memory regions failed\n");
+			ehea_error("creation of shared memory regions failed");
 			goto out;
 		}
 
@@ -2909,7 +2818,7 @@ int ehea_restart_qps(struct net_device *dev)
 					    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF),
 					    cb0);
 		if (hret != H_SUCCESS) {
-			netdev_err(dev, "query_ehea_qp failed (1)\n");
+			ehea_error("query_ehea_qp failed (1)");
 			goto out;
 		}
 
@@ -2921,7 +2830,7 @@ int ehea_restart_qps(struct net_device *dev)
 							    1), cb0, &dummy64,
 					     &dummy64, &dummy16, &dummy16);
 		if (hret != H_SUCCESS) {
-			netdev_err(dev, "modify_ehea_qp failed (1)\n");
+			ehea_error("modify_ehea_qp failed (1)");
 			goto out;
 		}
 
@@ -2929,7 +2838,7 @@ int ehea_restart_qps(struct net_device *dev)
 					    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF),
 					    cb0);
 		if (hret != H_SUCCESS) {
-			netdev_err(dev, "query_ehea_qp failed (2)\n");
+			ehea_error("query_ehea_qp failed (2)");
 			goto out;
 		}
 
@@ -2966,7 +2875,8 @@ static void ehea_reset_port(struct work_struct *work)
 
 	ehea_set_multicast_list(dev);
 
-	netif_info(port, timer, dev, "reset successful\n");
+	if (netif_msg_timer(port))
+		ehea_info("Device %s resetted successfully", dev->name);
 
 	port_napi_enable(port);
 
@@ -2976,12 +2886,12 @@ out:
 	mutex_unlock(&dlpar_mem_lock);
 }
 
-static void ehea_rereg_mrs(void)
+static void ehea_rereg_mrs(struct work_struct *work)
 {
 	int ret, i;
 	struct ehea_adapter *adapter;
 
-	pr_info("LPAR memory changed - re-initializing driver\n");
+	ehea_info("LPAR memory changed - re-initializing driver");
 
 	list_for_each_entry(adapter, &adapter_list, list)
 		if (adapter->active_ports) {
@@ -3007,13 +2917,13 @@ static void ehea_rereg_mrs(void)
 					port_napi_disable(port);
 					mutex_unlock(&port->port_lock);
 				}
-				reset_sq_restart_flag(port);
 			}
 
 			/* Unregister old memory region */
 			ret = ehea_rem_mr(&adapter->mr);
 			if (ret) {
-				pr_err("unregister MR failed - driver inoperable!\n");
+				ehea_error("unregister MR failed - driver"
+					   " inoperable!");
 				goto out;
 			}
 		}
@@ -3025,7 +2935,8 @@ static void ehea_rereg_mrs(void)
 			/* Register new memory region */
 			ret = ehea_reg_kernel_mr(adapter, &adapter->mr);
 			if (ret) {
-				pr_err("register MR failed - driver inoperable!\n");
+				ehea_error("register MR failed - driver"
+					   " inoperable!");
 				goto out;
 			}
 
@@ -3038,20 +2949,16 @@ static void ehea_rereg_mrs(void)
 
 					if (dev->flags & IFF_UP) {
 						mutex_lock(&port->port_lock);
+						port_napi_enable(port);
 						ret = ehea_restart_qps(dev);
-						if (!ret) {
-							check_sqs(port);
-							port_napi_enable(port);
+						if (!ret)
 							netif_wake_queue(dev);
-						} else {
-							netdev_err(dev, "Unable to restart QPS\n");
-						}
 						mutex_unlock(&port->port_lock);
 					}
 				}
 			}
 		}
-	pr_info("re-initializing driver complete\n");
+	ehea_info("re-initializing driver complete");
 out:
 	return;
 }
@@ -3104,7 +3011,7 @@ int ehea_get_jumboframe_status(struct ehea_port *port, int *jumbo)
 	/* (Try to) enable *jumbo frames */
 	cb4 = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!cb4) {
-		pr_err("no mem for cb4\n");
+		ehea_error("no mem for cb4");
 		ret = -ENOMEM;
 		goto out;
 	} else {
@@ -3166,13 +3073,13 @@ static struct device *ehea_register_port(struct ehea_port *port,
 
 	ret = of_device_register(&port->ofdev);
 	if (ret) {
-		pr_err("failed to register device. ret=%d\n", ret);
+		ehea_error("failed to register device. ret=%d", ret);
 		goto out;
 	}
 
 	ret = device_create_file(&port->ofdev.dev, &dev_attr_log_port_id);
 	if (ret) {
-		pr_err("failed to register attributes, ret=%d\n", ret);
+		ehea_error("failed to register attributes, ret=%d", ret);
 		goto out_unreg_of_dev;
 	}
 
@@ -3222,7 +3129,7 @@ struct ehea_port *ehea_setup_single_port(struct ehea_adapter *adapter,
 	dev = alloc_etherdev(sizeof(struct ehea_port));
 
 	if (!dev) {
-		pr_err("no mem for net_device\n");
+		ehea_error("no mem for net_device");
 		ret = -ENOMEM;
 		goto out_err;
 	}
@@ -3263,25 +3170,17 @@ struct ehea_port *ehea_setup_single_port(struct ehea_adapter *adapter,
 	dev->netdev_ops = &ehea_netdev_ops;
 	ehea_set_ethtool_ops(dev);
 
-	dev->hw_features = NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_TSO
-		      | NETIF_F_IP_CSUM | NETIF_F_HW_VLAN_TX | NETIF_F_LRO;
 	dev->features = NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_TSO
 		      | NETIF_F_HIGHDMA | NETIF_F_IP_CSUM | NETIF_F_HW_VLAN_TX
 		      | NETIF_F_HW_VLAN_RX | NETIF_F_HW_VLAN_FILTER
-		      | NETIF_F_LLTX | NETIF_F_RXCSUM;
+		      | NETIF_F_LLTX;
 	dev->watchdog_timeo = EHEA_WATCH_DOG_TIMEOUT;
-
-	if (use_lro)
-		dev->features |= NETIF_F_LRO;
 
 	INIT_WORK(&port->reset_task, ehea_reset_port);
 
-	init_waitqueue_head(&port->swqe_avail_wq);
-	init_waitqueue_head(&port->restart_wq);
-
 	ret = register_netdev(dev);
 	if (ret) {
-		pr_err("register_netdev failed. ret=%d\n", ret);
+		ehea_error("register_netdev failed. ret=%d", ret);
 		goto out_unreg_port;
 	}
 
@@ -3289,10 +3188,11 @@ struct ehea_port *ehea_setup_single_port(struct ehea_adapter *adapter,
 
 	ret = ehea_get_jumboframe_status(port, &jumbo);
 	if (ret)
-		netdev_err(dev, "failed determining jumbo frame status\n");
+		ehea_error("failed determining jumbo frame status for %s",
+			   port->netdev->name);
 
-	netdev_info(dev, "Jumbo frames are %sabled\n",
-		    jumbo == 1 ? "en" : "dis");
+	ehea_info("%s: Jumbo frames are %sabled", dev->name,
+		  jumbo == 1 ? "en" : "dis");
 
 	adapter->active_ports++;
 
@@ -3308,16 +3208,14 @@ out_free_ethdev:
 	free_netdev(dev);
 
 out_err:
-	pr_err("setting up logical port with id=%d failed, ret=%d\n",
-	       logical_port_id, ret);
+	ehea_error("setting up logical port with id=%d failed, ret=%d",
+		   logical_port_id, ret);
 	return NULL;
 }
 
 static void ehea_shutdown_single_port(struct ehea_port *port)
 {
 	struct ehea_adapter *adapter = port->adapter;
-
-	cancel_work_sync(&port->reset_task);
 	unregister_netdev(port->netdev);
 	ehea_unregister_port(port);
 	kfree(port->mc_list);
@@ -3339,13 +3237,13 @@ static int ehea_setup_ports(struct ehea_adapter *adapter)
 		dn_log_port_id = of_get_property(eth_dn, "ibm,hea-port-no",
 						 NULL);
 		if (!dn_log_port_id) {
-			pr_err("bad device node: eth_dn name=%s\n",
-			       eth_dn->full_name);
+			ehea_error("bad device node: eth_dn name=%s",
+				   eth_dn->full_name);
 			continue;
 		}
 
 		if (ehea_add_adapter_mr(adapter)) {
-			pr_err("creating MR failed\n");
+			ehea_error("creating MR failed");
 			of_node_put(eth_dn);
 			return -EIO;
 		}
@@ -3354,8 +3252,9 @@ static int ehea_setup_ports(struct ehea_adapter *adapter)
 							  *dn_log_port_id,
 							  eth_dn);
 		if (adapter->port[i])
-			netdev_info(adapter->port[i]->netdev,
-				    "logical port id #%d\n", *dn_log_port_id);
+			ehea_info("%s -> logical port id #%d",
+				  adapter->port[i]->netdev->name,
+				  *dn_log_port_id);
 		else
 			ehea_remove_adapter_mr(adapter);
 
@@ -3400,20 +3299,21 @@ static ssize_t ehea_probe_port(struct device *dev,
 	port = ehea_get_port(adapter, logical_port_id);
 
 	if (port) {
-		netdev_info(port->netdev, "adding port with logical port id=%d failed: port already configured\n",
-			    logical_port_id);
+		ehea_info("adding port with logical port id=%d failed. port "
+			  "already configured as %s.", logical_port_id,
+			  port->netdev->name);
 		return -EINVAL;
 	}
 
 	eth_dn = ehea_get_eth_dn(adapter, logical_port_id);
 
 	if (!eth_dn) {
-		pr_info("no logical port with id %d found\n", logical_port_id);
+		ehea_info("no logical port with id %d found", logical_port_id);
 		return -EINVAL;
 	}
 
 	if (ehea_add_adapter_mr(adapter)) {
-		pr_err("creating MR failed\n");
+		ehea_error("creating MR failed");
 		return -EIO;
 	}
 
@@ -3428,8 +3328,8 @@ static ssize_t ehea_probe_port(struct device *dev,
 				break;
 			}
 
-		netdev_info(port->netdev, "added: (logical port id=%d)\n",
-			    logical_port_id);
+		ehea_info("added %s (logical port id=%d)", port->netdev->name,
+			  logical_port_id);
 	} else {
 		ehea_remove_adapter_mr(adapter);
 		return -EIO;
@@ -3452,8 +3352,8 @@ static ssize_t ehea_remove_port(struct device *dev,
 	port = ehea_get_port(adapter, logical_port_id);
 
 	if (port) {
-		netdev_info(port->netdev, "removed: (logical port id=%d)\n",
-			    logical_port_id);
+		ehea_info("removed %s (logical port id=%d)", port->netdev->name,
+			  logical_port_id);
 
 		ehea_shutdown_single_port(port);
 
@@ -3463,8 +3363,8 @@ static ssize_t ehea_remove_port(struct device *dev,
 				break;
 			}
 	} else {
-		pr_err("removing port with logical port id=%d failed. port not configured.\n",
-		       logical_port_id);
+		ehea_error("removing port with logical port id=%d failed. port "
+			   "not configured.", logical_port_id);
 		return -EINVAL;
 	}
 
@@ -3476,7 +3376,7 @@ static ssize_t ehea_remove_port(struct device *dev,
 static DEVICE_ATTR(probe_port, S_IWUSR, NULL, ehea_probe_port);
 static DEVICE_ATTR(remove_port, S_IWUSR, NULL, ehea_remove_port);
 
-int ehea_create_device_sysfs(struct platform_device *dev)
+int ehea_create_device_sysfs(struct of_device *dev)
 {
 	int ret = device_create_file(&dev->dev, &dev_attr_probe_port);
 	if (ret)
@@ -3487,13 +3387,13 @@ out:
 	return ret;
 }
 
-void ehea_remove_device_sysfs(struct platform_device *dev)
+void ehea_remove_device_sysfs(struct of_device *dev)
 {
 	device_remove_file(&dev->dev, &dev_attr_probe_port);
 	device_remove_file(&dev->dev, &dev_attr_remove_port);
 }
 
-static int __devinit ehea_probe_adapter(struct platform_device *dev,
+static int __devinit ehea_probe_adapter(struct of_device *dev,
 					const struct of_device_id *id)
 {
 	struct ehea_adapter *adapter;
@@ -3501,7 +3401,7 @@ static int __devinit ehea_probe_adapter(struct platform_device *dev,
 	int ret;
 
 	if (!dev || !dev->dev.of_node) {
-		pr_err("Invalid ibmebus device probed\n");
+		ehea_error("Invalid ibmebus device probed");
 		return -EINVAL;
 	}
 
@@ -3592,7 +3492,7 @@ out:
 	return ret;
 }
 
-static int __devexit ehea_remove(struct platform_device *dev)
+static int __devexit ehea_remove(struct of_device *dev)
 {
 	struct ehea_adapter *adapter = dev_get_drvdata(&dev->dev);
 	int i;
@@ -3604,6 +3504,8 @@ static int __devexit ehea_remove(struct platform_device *dev)
 		}
 
 	ehea_remove_device_sysfs(dev);
+
+	flush_scheduled_work();
 
 	ibmebus_free_irq(adapter->neq->attr.ist1, adapter);
 	tasklet_kill(&adapter->neq_tasklet);
@@ -3647,21 +3549,21 @@ static int ehea_mem_notifier(struct notifier_block *nb,
 
 	switch (action) {
 	case MEM_CANCEL_OFFLINE:
-		pr_info("memory offlining canceled");
+		ehea_info("memory offlining canceled");
 		/* Readd canceled memory block */
 	case MEM_ONLINE:
-		pr_info("memory is going online");
+		ehea_info("memory is going online");
 		set_bit(__EHEA_STOP_XFER, &ehea_driver_flags);
 		if (ehea_add_sect_bmap(arg->start_pfn, arg->nr_pages))
 			goto out_unlock;
-		ehea_rereg_mrs();
+		ehea_rereg_mrs(NULL);
 		break;
 	case MEM_GOING_OFFLINE:
-		pr_info("memory is going offline");
+		ehea_info("memory is going offline");
 		set_bit(__EHEA_STOP_XFER, &ehea_driver_flags);
 		if (ehea_rem_sect_bmap(arg->start_pfn, arg->nr_pages))
 			goto out_unlock;
-		ehea_rereg_mrs();
+		ehea_rereg_mrs(NULL);
 		break;
 	default:
 		break;
@@ -3683,7 +3585,7 @@ static int ehea_reboot_notifier(struct notifier_block *nb,
 				unsigned long action, void *unused)
 {
 	if (action == SYS_RESTART) {
-		pr_info("Reboot: freeing all eHEA resources\n");
+		ehea_info("Reboot: freeing all eHEA resources");
 		ibmebus_unregister_driver(&ehea_driver);
 	}
 	return NOTIFY_DONE;
@@ -3699,22 +3601,22 @@ static int check_module_parm(void)
 
 	if ((rq1_entries < EHEA_MIN_ENTRIES_QP) ||
 	    (rq1_entries > EHEA_MAX_ENTRIES_RQ1)) {
-		pr_info("Bad parameter: rq1_entries\n");
+		ehea_info("Bad parameter: rq1_entries");
 		ret = -EINVAL;
 	}
 	if ((rq2_entries < EHEA_MIN_ENTRIES_QP) ||
 	    (rq2_entries > EHEA_MAX_ENTRIES_RQ2)) {
-		pr_info("Bad parameter: rq2_entries\n");
+		ehea_info("Bad parameter: rq2_entries");
 		ret = -EINVAL;
 	}
 	if ((rq3_entries < EHEA_MIN_ENTRIES_QP) ||
 	    (rq3_entries > EHEA_MAX_ENTRIES_RQ3)) {
-		pr_info("Bad parameter: rq3_entries\n");
+		ehea_info("Bad parameter: rq3_entries");
 		ret = -EINVAL;
 	}
 	if ((sq_entries < EHEA_MIN_ENTRIES_QP) ||
 	    (sq_entries > EHEA_MAX_ENTRIES_SQ)) {
-		pr_info("Bad parameter: sq_entries\n");
+		ehea_info("Bad parameter: sq_entries");
 		ret = -EINVAL;
 	}
 
@@ -3734,8 +3636,11 @@ int __init ehea_module_init(void)
 {
 	int ret;
 
-	pr_info("IBM eHEA ethernet device driver (Release %s)\n", DRV_VERSION);
+	printk(KERN_INFO "IBM eHEA ethernet device driver (Release %s)\n",
+	       DRV_VERSION);
 
+
+	INIT_WORK(&ehea_rereg_mr_task, ehea_rereg_mrs);
 	memset(&ehea_fw_handles, 0, sizeof(ehea_fw_handles));
 	memset(&ehea_bcmc_regs, 0, sizeof(ehea_bcmc_regs));
 
@@ -3752,27 +3657,27 @@ int __init ehea_module_init(void)
 
 	ret = register_reboot_notifier(&ehea_reboot_nb);
 	if (ret)
-		pr_info("failed registering reboot notifier\n");
+		ehea_info("failed registering reboot notifier");
 
 	ret = register_memory_notifier(&ehea_mem_nb);
 	if (ret)
-		pr_info("failed registering memory remove notifier\n");
+		ehea_info("failed registering memory remove notifier");
 
-	ret = crash_shutdown_register(ehea_crash_handler);
+	ret = crash_shutdown_register(&ehea_crash_handler);
 	if (ret)
-		pr_info("failed registering crash handler\n");
+		ehea_info("failed registering crash handler");
 
 	ret = ibmebus_register_driver(&ehea_driver);
 	if (ret) {
-		pr_err("failed registering eHEA device driver on ebus\n");
+		ehea_error("failed registering eHEA device driver on ebus");
 		goto out2;
 	}
 
 	ret = driver_create_file(&ehea_driver.driver,
 				 &driver_attr_capabilities);
 	if (ret) {
-		pr_err("failed to register capabilities attribute, ret=%d\n",
-		       ret);
+		ehea_error("failed to register capabilities attribute, ret=%d",
+			   ret);
 		goto out3;
 	}
 
@@ -3783,7 +3688,7 @@ out3:
 out2:
 	unregister_memory_notifier(&ehea_mem_nb);
 	unregister_reboot_notifier(&ehea_reboot_nb);
-	crash_shutdown_unregister(ehea_crash_handler);
+	crash_shutdown_unregister(&ehea_crash_handler);
 out:
 	return ret;
 }
@@ -3792,12 +3697,13 @@ static void __exit ehea_module_exit(void)
 {
 	int ret;
 
+	flush_scheduled_work();
 	driver_remove_file(&ehea_driver.driver, &driver_attr_capabilities);
 	ibmebus_unregister_driver(&ehea_driver);
 	unregister_reboot_notifier(&ehea_reboot_nb);
-	ret = crash_shutdown_unregister(ehea_crash_handler);
+	ret = crash_shutdown_unregister(&ehea_crash_handler);
 	if (ret)
-		pr_info("failed unregistering crash handler\n");
+		ehea_info("failed unregistering crash handler");
 	unregister_memory_notifier(&ehea_mem_nb);
 	kfree(ehea_fw_handles.arr);
 	kfree(ehea_bcmc_regs.arr);

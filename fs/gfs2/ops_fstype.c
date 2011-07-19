@@ -17,6 +17,7 @@
 #include <linux/namei.h>
 #include <linux/mount.h>
 #include <linux/gfs2_ondisk.h>
+#include <linux/slow-work.h>
 #include <linux/quotaops.h>
 
 #include "gfs2.h"
@@ -37,6 +38,14 @@
 
 #define DO 0
 #define UNDO 1
+
+static const u32 gfs2_old_fs_formats[] = {
+        0
+};
+
+static const u32 gfs2_old_multihost_formats[] = {
+        0
+};
 
 /**
  * gfs2_tune_init - Fill a gfs2_tune structure with default values
@@ -67,12 +76,11 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
 
 	sb->s_fs_info = sdp;
 	sdp->sd_vfs = sb;
-	set_bit(SDF_NOJOURNALID, &sdp->sd_flags);
+
 	gfs2_tune_init(&sdp->sd_tune);
 
 	init_waitqueue_head(&sdp->sd_glock_wait);
 	atomic_set(&sdp->sd_glock_disposal, 0);
-	init_completion(&sdp->sd_locking_init);
 	spin_lock_init(&sdp->sd_statfs_spin);
 
 	spin_lock_init(&sdp->sd_rindex_spin);
@@ -100,7 +108,6 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
 
 	init_waitqueue_head(&sdp->sd_log_waitq);
 	init_waitqueue_head(&sdp->sd_logd_waitq);
-	spin_lock_init(&sdp->sd_ail_lock);
 	INIT_LIST_HEAD(&sdp->sd_ail1_list);
 	INIT_LIST_HEAD(&sdp->sd_ail2_list);
 
@@ -127,9 +134,9 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
  * changed.
  */
 
-static int gfs2_check_sb(struct gfs2_sbd *sdp, int silent)
+static int gfs2_check_sb(struct gfs2_sbd *sdp, struct gfs2_sb_host *sb, int silent)
 {
-	struct gfs2_sb_host *sb = &sdp->sd_sb;
+	unsigned int x;
 
 	if (sb->sb_magic != GFS2_MAGIC ||
 	    sb->sb_type != GFS2_METATYPE_SB) {
@@ -144,9 +151,55 @@ static int gfs2_check_sb(struct gfs2_sbd *sdp, int silent)
 	    sb->sb_multihost_format == GFS2_FORMAT_MULTI)
 		return 0;
 
-	fs_warn(sdp, "Unknown on-disk format, unable to mount\n");
+	if (sb->sb_fs_format != GFS2_FORMAT_FS) {
+		for (x = 0; gfs2_old_fs_formats[x]; x++)
+			if (gfs2_old_fs_formats[x] == sb->sb_fs_format)
+				break;
 
-	return -EINVAL;
+		if (!gfs2_old_fs_formats[x]) {
+			printk(KERN_WARNING
+			       "GFS2: code version (%u, %u) is incompatible "
+			       "with ondisk format (%u, %u)\n",
+			       GFS2_FORMAT_FS, GFS2_FORMAT_MULTI,
+			       sb->sb_fs_format, sb->sb_multihost_format);
+			printk(KERN_WARNING
+			       "GFS2: I don't know how to upgrade this FS\n");
+			return -EINVAL;
+		}
+	}
+
+	if (sb->sb_multihost_format != GFS2_FORMAT_MULTI) {
+		for (x = 0; gfs2_old_multihost_formats[x]; x++)
+			if (gfs2_old_multihost_formats[x] ==
+			    sb->sb_multihost_format)
+				break;
+
+		if (!gfs2_old_multihost_formats[x]) {
+			printk(KERN_WARNING
+			       "GFS2: code version (%u, %u) is incompatible "
+			       "with ondisk format (%u, %u)\n",
+			       GFS2_FORMAT_FS, GFS2_FORMAT_MULTI,
+			       sb->sb_fs_format, sb->sb_multihost_format);
+			printk(KERN_WARNING
+			       "GFS2: I don't know how to upgrade this FS\n");
+			return -EINVAL;
+		}
+	}
+
+	if (!sdp->sd_args.ar_upgrade) {
+		printk(KERN_WARNING
+		       "GFS2: code version (%u, %u) is incompatible "
+		       "with ondisk format (%u, %u)\n",
+		       GFS2_FORMAT_FS, GFS2_FORMAT_MULTI,
+		       sb->sb_fs_format, sb->sb_multihost_format);
+		printk(KERN_INFO
+		       "GFS2: Use the \"upgrade\" mount option to upgrade "
+		       "the FS\n");
+		printk(KERN_INFO "GFS2: See the manual for more details\n");
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 static void end_bio_io_page(struct bio *bio, int error)
@@ -160,10 +213,8 @@ static void end_bio_io_page(struct bio *bio, int error)
 	unlock_page(page);
 }
 
-static void gfs2_sb_in(struct gfs2_sbd *sdp, const void *buf)
+static void gfs2_sb_in(struct gfs2_sb_host *sb, const void *buf)
 {
-	struct gfs2_sb_host *sb = &sdp->sd_sb;
-	struct super_block *s = sdp->sd_vfs;
 	const struct gfs2_sb *str = buf;
 
 	sb->sb_magic = be32_to_cpu(str->sb_header.mh_magic);
@@ -180,7 +231,7 @@ static void gfs2_sb_in(struct gfs2_sbd *sdp, const void *buf)
 
 	memcpy(sb->sb_lockproto, str->sb_lockproto, GFS2_LOCKNAME_LEN);
 	memcpy(sb->sb_locktable, str->sb_locktable, GFS2_LOCKNAME_LEN);
-	memcpy(s->s_uuid, str->sb_uuid, 16);
+	memcpy(sb->sb_uuid, str->sb_uuid, 16);
 }
 
 /**
@@ -202,7 +253,7 @@ static void gfs2_sb_in(struct gfs2_sbd *sdp, const void *buf)
  * Returns: 0 on success or error
  */
 
-static int gfs2_read_super(struct gfs2_sbd *sdp, sector_t sector, int silent)
+static int gfs2_read_super(struct gfs2_sbd *sdp, sector_t sector)
 {
 	struct super_block *sb = sdp->sd_vfs;
 	struct gfs2_sb *p;
@@ -224,7 +275,7 @@ static int gfs2_read_super(struct gfs2_sbd *sdp, sector_t sector, int silent)
 
 	bio->bi_end_io = end_bio_io_page;
 	bio->bi_private = page;
-	submit_bio(READ_SYNC | REQ_META, bio);
+	submit_bio(READ_SYNC | (1 << BIO_RW_META), bio);
 	wait_on_page_locked(page);
 	bio_put(bio);
 	if (!PageUptodate(page)) {
@@ -232,10 +283,10 @@ static int gfs2_read_super(struct gfs2_sbd *sdp, sector_t sector, int silent)
 		return -EIO;
 	}
 	p = kmap(page);
-	gfs2_sb_in(sdp, p);
+	gfs2_sb_in(&sdp->sd_sb, p);
 	kunmap(page);
 	__free_page(page);
-	return gfs2_check_sb(sdp, silent);
+	return 0;
 }
 
 /**
@@ -252,12 +303,16 @@ static int gfs2_read_sb(struct gfs2_sbd *sdp, int silent)
 	unsigned int x;
 	int error;
 
-	error = gfs2_read_super(sdp, GFS2_SB_ADDR >> sdp->sd_fsb2bb_shift, silent);
+	error = gfs2_read_super(sdp, GFS2_SB_ADDR >> sdp->sd_fsb2bb_shift);
 	if (error) {
 		if (!silent)
 			fs_err(sdp, "can't read superblock\n");
 		return error;
 	}
+
+	error = gfs2_check_sb(sdp, &sdp->sd_sb, silent);
+	if (error)
+		return error;
 
 	sdp->sd_fsb2bb_shift = sdp->sd_sb.sb_bsize_shift -
 			       GFS2_BASIC_BLOCK_SHIFT;
@@ -341,9 +396,13 @@ static int init_names(struct gfs2_sbd *sdp, int silent)
 	/*  Try to autodetect  */
 
 	if (!proto[0] || !table[0]) {
-		error = gfs2_read_super(sdp, GFS2_SB_ADDR >> sdp->sd_fsb2bb_shift, silent);
+		error = gfs2_read_super(sdp, GFS2_SB_ADDR >> sdp->sd_fsb2bb_shift);
 		if (error)
 			return error;
+
+		error = gfs2_check_sb(sdp, &sdp->sd_sb, silent);
+		if (error)
+			goto out;
 
 		if (!proto[0])
 			proto = sdp->sd_sb.sb_lockproto;
@@ -361,6 +420,7 @@ static int init_names(struct gfs2_sbd *sdp, int silent)
 	while ((table = strchr(table, '/')))
 		*table = '_';
 
+out:
 	return error;
 }
 
@@ -426,7 +486,7 @@ static int gfs2_lookup_root(struct super_block *sb, struct dentry **dptr,
 	struct dentry *dentry;
 	struct inode *inode;
 
-	inode = gfs2_inode_lookup(sb, DT_DIR, no_addr, 0, 0);
+	inode = gfs2_inode_lookup(sb, DT_DIR, no_addr, 0);
 	if (IS_ERR(inode)) {
 		fs_err(sdp, "can't read in %s inode: %ld\n", name, PTR_ERR(inode));
 		return PTR_ERR(inode);
@@ -437,6 +497,7 @@ static int gfs2_lookup_root(struct super_block *sb, struct dentry **dptr,
 		iput(inode);
 		return -ENOMEM;
 	}
+	dentry->d_op = &gfs2_dops;
 	*dptr = dentry;
 	return 0;
 }
@@ -526,7 +587,7 @@ static int map_journal_extents(struct gfs2_sbd *sdp)
 
 	prev_db = 0;
 
-	for (lb = 0; lb < i_size_read(jd->jd_inode) >> sdp->sd_sb.sb_bsize_shift; lb++) {
+	for (lb = 0; lb < ip->i_disksize >> sdp->sd_sb.sb_bsize_shift; lb++) {
 		bh.b_state = 0;
 		bh.b_blocknr = 0;
 		bh.b_size = 1 << ip->i_inode.i_blkbits;
@@ -612,7 +673,7 @@ static int gfs2_jindex_hold(struct gfs2_sbd *sdp, struct gfs2_holder *ji_gh)
 			break;
 
 		INIT_LIST_HEAD(&jd->extent_list);
-		INIT_WORK(&jd->jd_work, gfs2_recover_func);
+		slow_work_init(&jd->jd_work, &gfs2_recover_ops);
 		jd->jd_inode = gfs2_lookupi(sdp->sd_jindex, &name, 1);
 		if (!jd->jd_inode || IS_ERR(jd->jd_inode)) {
 			if (!jd->jd_inode)
@@ -721,8 +782,7 @@ static int init_journal(struct gfs2_sbd *sdp, int undo)
 	if (sdp->sd_lockstruct.ls_first) {
 		unsigned int x;
 		for (x = 0; x < sdp->sd_journals; x++) {
-			error = gfs2_recover_journal(gfs2_jdesc_find(sdp, x),
-						     true);
+			error = gfs2_recover_journal(gfs2_jdesc_find(sdp, x));
 			if (error) {
 				fs_err(sdp, "error recovering journal %u: %d\n",
 				       x, error);
@@ -732,7 +792,7 @@ static int init_journal(struct gfs2_sbd *sdp, int undo)
 
 		gfs2_others_may_mount(sdp);
 	} else if (!sdp->sd_args.ar_spectator) {
-		error = gfs2_recover_journal(sdp->sd_jdesc, true);
+		error = gfs2_recover_journal(sdp->sd_jdesc);
 		if (error) {
 			fs_err(sdp, "error recovering my journal: %d\n", error);
 			goto fail_jinode_gh;
@@ -925,9 +985,17 @@ static const match_table_t nolock_tokens = {
 	{ Opt_err, NULL },
 };
 
+static void nolock_put_lock(struct kmem_cache *cachep, struct gfs2_glock *gl)
+{
+	struct gfs2_sbd *sdp = gl->gl_sbd;
+	kmem_cache_free(cachep, gl);
+	if (atomic_dec_and_test(&sdp->sd_glock_disposal))
+		wake_up(&sdp->sd_glock_wait);
+}
+
 static const struct lm_lockops nolock_ops = {
 	.lm_proto_name = "lock_nolock",
-	.lm_put_lock = gfs2_glock_free,
+	.lm_put_lock = nolock_put_lock,
 	.lm_tokens = &nolock_tokens,
 };
 
@@ -954,6 +1022,7 @@ static int gfs2_lm_mount(struct gfs2_sbd *sdp, int silent)
 	if (!strcmp("lock_nolock", proto)) {
 		lm = &nolock_ops;
 		sdp->sd_args.ar_localflocks = 1;
+		sdp->sd_args.ar_localcaching = 1;
 #ifdef CONFIG_GFS2_FS_LOCKING_DLM
 	} else if (!strcmp("lock_dlm", proto)) {
 		lm = &gfs2_dlm_ops;
@@ -981,8 +1050,7 @@ static int gfs2_lm_mount(struct gfs2_sbd *sdp, int silent)
 			ret = match_int(&tmp[0], &option);
 			if (ret || option < 0) 
 				goto hostdata_error;
-			if (test_and_clear_bit(SDF_NOJOURNALID, &sdp->sd_flags))
-				ls->ls_jid = option;
+			ls->ls_jid = option;
 			break;
 		case Opt_id:
 			/* Obsolete, but left for backward compat purposes */
@@ -1018,13 +1086,11 @@ hostdata_error:
 		fsname++;
 	if (lm->lm_mount == NULL) {
 		fs_info(sdp, "Now mounting FS...\n");
-		complete(&sdp->sd_locking_init);
 		return 0;
 	}
 	ret = lm->lm_mount(sdp, fsname);
 	if (ret == 0)
 		fs_info(sdp, "Joined cluster. Now mounting FS...\n");
-	complete(&sdp->sd_locking_init);
 	return ret;
 }
 
@@ -1034,22 +1100,6 @@ void gfs2_lm_unmount(struct gfs2_sbd *sdp)
 	if (likely(!test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) &&
 	    lm->lm_unmount)
 		lm->lm_unmount(sdp);
-}
-
-static int gfs2_journalid_wait(void *word)
-{
-	if (signal_pending(current))
-		return -EINTR;
-	schedule();
-	return 0;
-}
-
-static int wait_on_journal(struct gfs2_sbd *sdp)
-{
-	if (sdp->sd_lockstruct.ls_ops->lm_mount == NULL)
-		return 0;
-
-	return wait_on_bit(&sdp->sd_flags, SDF_NOJOURNALID, gfs2_journalid_wait, TASK_INTERRUPTIBLE);
 }
 
 void gfs2_online_uevent(struct gfs2_sbd *sdp)
@@ -1096,7 +1146,6 @@ static int fill_super(struct super_block *sb, struct gfs2_args *args, int silent
 
 	sb->s_magic = GFS2_MAGIC;
 	sb->s_op = &gfs2_super_ops;
-	sb->s_d_op = &gfs2_dops;
 	sb->s_export_op = &gfs2_export_ops;
 	sb->s_xattr = gfs2_xattr_handlers;
 	sb->s_qcop = &gfs2_quotactl_ops;
@@ -1117,7 +1166,8 @@ static int fill_super(struct super_block *sb, struct gfs2_args *args, int silent
 	if (sdp->sd_args.ar_statfs_quantum) {
 		sdp->sd_tune.gt_statfs_slow = 0;
 		sdp->sd_tune.gt_statfs_quantum = sdp->sd_args.ar_statfs_quantum;
-	} else {
+	}
+	else {
 		sdp->sd_tune.gt_statfs_slow = 1;
 		sdp->sd_tune.gt_statfs_quantum = 30;
 	}
@@ -1143,24 +1193,6 @@ static int fill_super(struct super_block *sb, struct gfs2_args *args, int silent
 	error = init_sb(sdp, silent);
 	if (error)
 		goto fail_locking;
-
-	error = wait_on_journal(sdp);
-	if (error)
-		goto fail_sb;
-
-	/*
-	 * If user space has failed to join the cluster or some similar
-	 * failure has occurred, then the journal id will contain a
-	 * negative (error) number. This will then be returned to the
-	 * caller (of the mount syscall). We do this even for spectator
-	 * mounts (which just write a jid of 0 to indicate "ok" even though
-	 * the jid is unused in the spectator case)
-	 */
-	if (sdp->sd_lockstruct.ls_jid < 0) {
-		error = sdp->sd_lockstruct.ls_jid;
-		sdp->sd_lockstruct.ls_jid = 0;
-		goto fail_sb;
-	}
 
 	error = init_inodes(sdp, DO);
 	if (error)
@@ -1209,6 +1241,7 @@ fail_sb:
 fail_locking:
 	init_locking(sdp, &mount_gh, UNDO);
 fail_lm:
+	invalidate_inodes(sb);
 	gfs2_gl_hash_clear(sdp);
 	gfs2_lm_unmount(sdp);
 fail_sys:
@@ -1240,11 +1273,12 @@ static int test_gfs2_super(struct super_block *s, void *ptr)
 }
 
 /**
- * gfs2_mount - Get the GFS2 superblock
+ * gfs2_get_sb - Get the GFS2 superblock
  * @fs_type: The GFS2 filesystem type
  * @flags: Mount flags
  * @dev_name: The name of the device
  * @data: The mount arguments
+ * @mnt: The vfsmnt for this mount
  *
  * Q. Why not use get_sb_bdev() ?
  * A. We need to select one of two root directories to mount, independent
@@ -1253,12 +1287,12 @@ static int test_gfs2_super(struct super_block *s, void *ptr)
  * Returns: 0 or -ve on error
  */
 
-static struct dentry *gfs2_mount(struct file_system_type *fs_type, int flags,
-		       const char *dev_name, void *data)
+static int gfs2_get_sb(struct file_system_type *fs_type, int flags,
+		       const char *dev_name, void *data, struct vfsmount *mnt)
 {
 	struct block_device *bdev;
 	struct super_block *s;
-	fmode_t mode = FMODE_READ | FMODE_EXCL;
+	fmode_t mode = FMODE_READ;
 	int error;
 	struct gfs2_args args;
 	struct gfs2_sbd *sdp;
@@ -1266,9 +1300,9 @@ static struct dentry *gfs2_mount(struct file_system_type *fs_type, int flags,
 	if (!(flags & MS_RDONLY))
 		mode |= FMODE_WRITE;
 
-	bdev = blkdev_get_by_path(dev_name, mode, fs_type);
+	bdev = open_bdev_exclusive(dev_name, mode, fs_type);
 	if (IS_ERR(bdev))
-		return ERR_CAST(bdev);
+		return PTR_ERR(bdev);
 
 	/*
 	 * once the super is inserted into the list by sget, s_umount
@@ -1287,9 +1321,6 @@ static struct dentry *gfs2_mount(struct file_system_type *fs_type, int flags,
 	if (IS_ERR(s))
 		goto error_bdev;
 
-	if (s->s_root)
-		blkdev_put(bdev, mode);
-
 	memset(&args, 0, sizeof(args));
 	args.ar_quota = GFS2_QUOTA_DEFAULT;
 	args.ar_data = GFS2_DATA_DEFAULT;
@@ -1301,13 +1332,17 @@ static struct dentry *gfs2_mount(struct file_system_type *fs_type, int flags,
 	error = gfs2_mount_args(&args, data);
 	if (error) {
 		printk(KERN_WARNING "GFS2: can't parse mount arguments\n");
-		goto error_super;
+		if (s->s_root)
+			goto error_super;
+		deactivate_locked_super(s);
+		return error;
 	}
 
 	if (s->s_root) {
 		error = -EBUSY;
 		if ((flags ^ s->s_flags) & MS_RDONLY)
 			goto error_super;
+		close_bdev_exclusive(bdev, mode);
 	} else {
 		char b[BDEVNAME_SIZE];
 
@@ -1316,24 +1351,27 @@ static struct dentry *gfs2_mount(struct file_system_type *fs_type, int flags,
 		strlcpy(s->s_id, bdevname(bdev, b), sizeof(s->s_id));
 		sb_set_blocksize(s, block_size(bdev));
 		error = fill_super(s, &args, flags & MS_SILENT ? 1 : 0);
-		if (error)
-			goto error_super;
+		if (error) {
+			deactivate_locked_super(s);
+			return error;
+		}
 		s->s_flags |= MS_ACTIVE;
 		bdev->bd_super = s;
 	}
 
 	sdp = s->s_fs_info;
+	mnt->mnt_sb = s;
 	if (args.ar_meta)
-		return dget(sdp->sd_master_dir);
+		mnt->mnt_root = dget(sdp->sd_master_dir);
 	else
-		return dget(sdp->sd_root_dir);
+		mnt->mnt_root = dget(sdp->sd_root_dir);
+	return 0;
 
 error_super:
 	deactivate_locked_super(s);
-	return ERR_PTR(error);
 error_bdev:
-	blkdev_put(bdev, mode);
-	return ERR_PTR(error);
+	close_bdev_exclusive(bdev, mode);
+	return error;
 }
 
 static int set_meta_super(struct super_block *s, void *ptr)
@@ -1341,8 +1379,8 @@ static int set_meta_super(struct super_block *s, void *ptr)
 	return -EINVAL;
 }
 
-static struct dentry *gfs2_mount_meta(struct file_system_type *fs_type,
-			int flags, const char *dev_name, void *data)
+static int gfs2_get_sb_meta(struct file_system_type *fs_type, int flags,
+			    const char *dev_name, void *data, struct vfsmount *mnt)
 {
 	struct super_block *s;
 	struct gfs2_sbd *sdp;
@@ -1353,21 +1391,23 @@ static struct dentry *gfs2_mount_meta(struct file_system_type *fs_type,
 	if (error) {
 		printk(KERN_WARNING "GFS2: path_lookup on %s returned error %d\n",
 		       dev_name, error);
-		return ERR_PTR(error);
+		return error;
 	}
 	s = sget(&gfs2_fs_type, test_gfs2_super, set_meta_super,
 		 path.dentry->d_inode->i_sb->s_bdev);
 	path_put(&path);
 	if (IS_ERR(s)) {
 		printk(KERN_WARNING "GFS2: gfs2 mount does not exist\n");
-		return ERR_CAST(s);
+		return PTR_ERR(s);
 	}
 	if ((flags ^ s->s_flags) & MS_RDONLY) {
 		deactivate_locked_super(s);
-		return ERR_PTR(-EBUSY);
+		return -EBUSY;
 	}
 	sdp = s->s_fs_info;
-	return dget(sdp->sd_master_dir);
+	mnt->mnt_sb = s;
+	mnt->mnt_root = dget(sdp->sd_master_dir);
+	return 0;
 }
 
 static void gfs2_kill_sb(struct super_block *sb)
@@ -1393,7 +1433,7 @@ static void gfs2_kill_sb(struct super_block *sb)
 struct file_system_type gfs2_fs_type = {
 	.name = "gfs2",
 	.fs_flags = FS_REQUIRES_DEV,
-	.mount = gfs2_mount,
+	.get_sb = gfs2_get_sb,
 	.kill_sb = gfs2_kill_sb,
 	.owner = THIS_MODULE,
 };
@@ -1401,7 +1441,7 @@ struct file_system_type gfs2_fs_type = {
 struct file_system_type gfs2meta_fs_type = {
 	.name = "gfs2meta",
 	.fs_flags = FS_REQUIRES_DEV,
-	.mount = gfs2_mount_meta,
+	.get_sb = gfs2_get_sb_meta,
 	.owner = THIS_MODULE,
 };
 

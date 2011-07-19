@@ -1270,9 +1270,10 @@ static int read_pnode(struct ubifs_info *c, struct ubifs_nnode *parent, int iip)
 	lnum = branch->lnum;
 	offs = branch->offs;
 	pnode = kzalloc(sizeof(struct ubifs_pnode), GFP_NOFS);
-	if (!pnode)
-		return -ENOMEM;
-
+	if (!pnode) {
+		err = -ENOMEM;
+		goto out;
+	}
 	if (lnum == 0) {
 		/*
 		 * This pnode was not written which just means that the LEB
@@ -1362,7 +1363,6 @@ static int read_lsave(struct ubifs_info *c)
 		goto out;
 	for (i = 0; i < c->lsave_cnt; i++) {
 		int lnum = c->lsave[i];
-		struct ubifs_lprops *lprops;
 
 		/*
 		 * Due to automatic resizing, the values in the lsave table
@@ -1370,11 +1370,7 @@ static int read_lsave(struct ubifs_info *c)
 		 */
 		if (lnum >= c->leb_cnt)
 			continue;
-		lprops = ubifs_lpt_lookup(c, lnum);
-		if (IS_ERR(lprops)) {
-			err = PTR_ERR(lprops);
-			goto out;
-		}
+		ubifs_lpt_lookup(c, lnum);
 	}
 out:
 	vfree(buf);
@@ -1461,13 +1457,13 @@ struct ubifs_lprops *ubifs_lpt_lookup(struct ubifs_info *c, int lnum)
 		shft -= UBIFS_LPT_FANOUT_SHIFT;
 		nnode = ubifs_get_nnode(c, nnode, iip);
 		if (IS_ERR(nnode))
-			return ERR_CAST(nnode);
+			return ERR_PTR(PTR_ERR(nnode));
 	}
 	iip = ((i >> shft) & (UBIFS_LPT_FANOUT - 1));
 	shft -= UBIFS_LPT_FANOUT_SHIFT;
 	pnode = ubifs_get_pnode(c, nnode, iip);
 	if (IS_ERR(pnode))
-		return ERR_CAST(pnode);
+		return ERR_PTR(PTR_ERR(pnode));
 	iip = (i & (UBIFS_LPT_FANOUT - 1));
 	dbg_lp("LEB %d, free %d, dirty %d, flags %d", lnum,
 	       pnode->lprops[iip].free, pnode->lprops[iip].dirty,
@@ -1590,7 +1586,7 @@ struct ubifs_lprops *ubifs_lpt_lookup_dirty(struct ubifs_info *c, int lnum)
 	nnode = c->nroot;
 	nnode = dirty_cow_nnode(c, nnode);
 	if (IS_ERR(nnode))
-		return ERR_CAST(nnode);
+		return ERR_PTR(PTR_ERR(nnode));
 	i = lnum - c->main_first;
 	shft = c->lpt_hght * UBIFS_LPT_FANOUT_SHIFT;
 	for (h = 1; h < c->lpt_hght; h++) {
@@ -1598,19 +1594,19 @@ struct ubifs_lprops *ubifs_lpt_lookup_dirty(struct ubifs_info *c, int lnum)
 		shft -= UBIFS_LPT_FANOUT_SHIFT;
 		nnode = ubifs_get_nnode(c, nnode, iip);
 		if (IS_ERR(nnode))
-			return ERR_CAST(nnode);
+			return ERR_PTR(PTR_ERR(nnode));
 		nnode = dirty_cow_nnode(c, nnode);
 		if (IS_ERR(nnode))
-			return ERR_CAST(nnode);
+			return ERR_PTR(PTR_ERR(nnode));
 	}
 	iip = ((i >> shft) & (UBIFS_LPT_FANOUT - 1));
 	shft -= UBIFS_LPT_FANOUT_SHIFT;
 	pnode = ubifs_get_pnode(c, nnode, iip);
 	if (IS_ERR(pnode))
-		return ERR_CAST(pnode);
+		return ERR_PTR(PTR_ERR(pnode));
 	pnode = dirty_cow_pnode(c, pnode);
 	if (IS_ERR(pnode))
-		return ERR_CAST(pnode);
+		return ERR_PTR(PTR_ERR(pnode));
 	iip = (i & (UBIFS_LPT_FANOUT - 1));
 	dbg_lp("LEB %d, free %d, dirty %d, flags %d", lnum,
 	       pnode->lprops[iip].free, pnode->lprops[iip].dirty,

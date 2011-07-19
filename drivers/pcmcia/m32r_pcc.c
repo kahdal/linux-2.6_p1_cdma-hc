@@ -27,7 +27,9 @@
 #include <asm/system.h>
 #include <asm/addrspace.h>
 
+#include <pcmcia/cs_types.h>
 #include <pcmcia/ss.h>
+#include <pcmcia/cs.h>
 
 /* XXX: should be moved into asm/irq.h */
 #define PCC0_IRQ 24

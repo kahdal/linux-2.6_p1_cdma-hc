@@ -1022,7 +1022,7 @@ static int ib_umad_init_port(struct ib_device *device, int port_num,
 
 	port->ib_dev   = device;
 	port->port_num = port_num;
-	sema_init(&port->sm_sem, 1);
+	init_MUTEX(&port->sm_sem);
 	mutex_init(&port->file_mutex);
 	INIT_LIST_HEAD(&port->file_list);
 
@@ -1085,6 +1085,7 @@ err_cdev:
 static void ib_umad_kill_port(struct ib_umad_port *port)
 {
 	struct ib_umad_file *file;
+	int already_dead;
 	int id;
 
 	dev_set_drvdata(port->dev,    NULL);
@@ -1102,6 +1103,7 @@ static void ib_umad_kill_port(struct ib_umad_port *port)
 
 	list_for_each_entry(file, &port->file_list, port_list) {
 		mutex_lock(&file->mutex);
+		already_dead = file->agents_dead;
 		file->agents_dead = 1;
 		mutex_unlock(&file->mutex);
 
@@ -1176,11 +1178,6 @@ static void ib_umad_remove_one(struct ib_device *device)
 	kref_put(&umad_dev->ref, ib_umad_release_dev);
 }
 
-static char *umad_devnode(struct device *dev, mode_t *mode)
-{
-	return kasprintf(GFP_KERNEL, "infiniband/%s", dev_name(dev));
-}
-
 static int __init ib_umad_init(void)
 {
 	int ret;
@@ -1198,8 +1195,6 @@ static int __init ib_umad_init(void)
 		printk(KERN_ERR "user_mad: couldn't create class infiniband_mad\n");
 		goto out_chrdev;
 	}
-
-	umad_class->devnode = umad_devnode;
 
 	ret = class_create_file(umad_class, &class_attr_abi_version.attr);
 	if (ret) {

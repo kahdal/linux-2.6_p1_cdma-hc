@@ -445,15 +445,11 @@ EXPORT_SYMBOL_GPL(apei_resources_sub);
 int apei_resources_request(struct apei_resources *resources,
 			   const char *desc)
 {
-	struct apei_res *res, *res_bak = NULL;
+	struct apei_res *res, *res_bak;
 	struct resource *r;
-	int rc;
 
-	rc = apei_resources_sub(resources, &apei_resources_all);
-	if (rc)
-		return rc;
+	apei_resources_sub(resources, &apei_resources_all);
 
-	rc = -EINVAL;
 	list_for_each_entry(res, &resources->iomem, list) {
 		r = request_mem_region(res->start, res->end - res->start,
 				       desc);
@@ -479,33 +475,28 @@ int apei_resources_request(struct apei_resources *resources,
 		}
 	}
 
-	rc = apei_resources_merge(&apei_resources_all, resources);
-	if (rc) {
-		pr_err(APEI_PFX "Fail to merge resources!\n");
-		goto err_unmap_ioport;
-	}
+	apei_resources_merge(&apei_resources_all, resources);
 
 	return 0;
 err_unmap_ioport:
 	list_for_each_entry(res, &resources->ioport, list) {
 		if (res == res_bak)
 			break;
-		release_region(res->start, res->end - res->start);
+		release_mem_region(res->start, res->end - res->start);
 	}
 	res_bak = NULL;
 err_unmap_iomem:
 	list_for_each_entry(res, &resources->iomem, list) {
 		if (res == res_bak)
 			break;
-		release_mem_region(res->start, res->end - res->start);
+		release_region(res->start, res->end - res->start);
 	}
-	return rc;
+	return -EINVAL;
 }
 EXPORT_SYMBOL_GPL(apei_resources_request);
 
 void apei_resources_release(struct apei_resources *resources)
 {
-	int rc;
 	struct apei_res *res;
 
 	list_for_each_entry(res, &resources->iomem, list)
@@ -513,9 +504,7 @@ void apei_resources_release(struct apei_resources *resources)
 	list_for_each_entry(res, &resources->ioport, list)
 		release_region(res->start, res->end - res->start);
 
-	rc = apei_resources_sub(&apei_resources_all, resources);
-	if (rc)
-		pr_err(APEI_PFX "Fail to sub resources!\n");
+	apei_resources_sub(&apei_resources_all, resources);
 }
 EXPORT_SYMBOL_GPL(apei_resources_release);
 

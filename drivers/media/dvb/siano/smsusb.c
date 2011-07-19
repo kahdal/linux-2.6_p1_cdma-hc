@@ -288,7 +288,8 @@ static int smsusb1_setmode(void *context, int mode)
 
 static void smsusb_term_device(struct usb_interface *intf)
 {
-	struct smsusb_device_t *dev = usb_get_intfdata(intf);
+	struct smsusb_device_t *dev =
+		(struct smsusb_device_t *) usb_get_intfdata(intf);
 
 	if (dev) {
 		smsusb_stop_streaming(dev);
@@ -297,8 +298,9 @@ static void smsusb_term_device(struct usb_interface *intf)
 		if (dev->coredev)
 			smscore_unregister_device(dev->coredev);
 
-		sms_info("device %p destroyed", dev);
 		kfree(dev);
+
+		sms_info("device %p destroyed", dev);
 	}
 
 	usb_set_intfdata(intf, NULL);
@@ -350,7 +352,8 @@ static int smsusb_init_device(struct usb_interface *intf, int board_id)
 	params.num_buffers = MAX_BUFFERS;
 	params.sendrequest_handler = smsusb_sendrequest;
 	params.context = dev;
-	usb_make_path(dev->udev, params.devpath, sizeof(params.devpath));
+	snprintf(params.devpath, sizeof(params.devpath),
+		 "usb\\%d-%s", dev->udev->bus->busnum, dev->udev->devpath);
 
 	/* register in smscore */
 	rc = smscore_register_device(&params, &dev->coredev);
@@ -443,7 +446,8 @@ static void smsusb_disconnect(struct usb_interface *intf)
 
 static int smsusb_suspend(struct usb_interface *intf, pm_message_t msg)
 {
-	struct smsusb_device_t *dev = usb_get_intfdata(intf);
+	struct smsusb_device_t *dev =
+		(struct smsusb_device_t *)usb_get_intfdata(intf);
 	printk(KERN_INFO "%s: Entering status %d.\n", __func__, msg.event);
 	smsusb_stop_streaming(dev);
 	return 0;
@@ -452,7 +456,8 @@ static int smsusb_suspend(struct usb_interface *intf, pm_message_t msg)
 static int smsusb_resume(struct usb_interface *intf)
 {
 	int rc, i;
-	struct smsusb_device_t *dev = usb_get_intfdata(intf);
+	struct smsusb_device_t *dev =
+		(struct smsusb_device_t *)usb_get_intfdata(intf);
 	struct usb_device *udev = interface_to_usbdev(intf);
 
 	printk(KERN_INFO "%s: Entering.\n", __func__);

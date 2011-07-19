@@ -51,10 +51,6 @@ static int driver_sysfs_add(struct device *dev)
 {
 	int ret;
 
-	if (dev->bus)
-		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
-					     BUS_NOTIFY_BIND_DRIVER, dev);
-
 	ret = sysfs_create_link(&dev->driver->p->kobj, &dev->kobj,
 			  kobject_name(&dev->kobj));
 	if (ret == 0) {
@@ -245,10 +241,6 @@ int device_attach(struct device *dev)
 
 	device_lock(dev);
 	if (dev->driver) {
-		if (klist_node_attached(&dev->p->knode_driver)) {
-			ret = 1;
-			goto out_unlock;
-		}
 		ret = device_bind_driver(dev);
 		if (ret == 0)
 			ret = 1;
@@ -261,7 +253,6 @@ int device_attach(struct device *dev)
 		ret = bus_for_each_drv(dev->bus, NULL, dev, __device_attach);
 		pm_runtime_put_sync(dev);
 	}
-out_unlock:
 	device_unlock(dev);
 	return ret;
 }
@@ -321,7 +312,8 @@ static void __device_release_driver(struct device *dev)
 
 	drv = dev->driver;
 	if (drv) {
-		pm_runtime_get_sync(dev);
+		pm_runtime_get_noresume(dev);
+		pm_runtime_barrier(dev);
 
 		driver_sysfs_remove(dev);
 
@@ -329,8 +321,6 @@ static void __device_release_driver(struct device *dev)
 			blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
 						     BUS_NOTIFY_UNBIND_DRIVER,
 						     dev);
-
-		pm_runtime_put_sync(dev);
 
 		if (dev->bus && dev->bus->remove)
 			dev->bus->remove(dev);
@@ -344,6 +334,7 @@ static void __device_release_driver(struct device *dev)
 						     BUS_NOTIFY_UNBOUND_DRIVER,
 						     dev);
 
+		pm_runtime_put_sync(dev);
 	}
 }
 
@@ -413,16 +404,17 @@ void *dev_get_drvdata(const struct device *dev)
 }
 EXPORT_SYMBOL(dev_get_drvdata);
 
-int dev_set_drvdata(struct device *dev, void *data)
+void dev_set_drvdata(struct device *dev, void *data)
 {
 	int error;
 
+	if (!dev)
+		return;
 	if (!dev->p) {
 		error = device_private_init(dev);
 		if (error)
-			return error;
+			return;
 	}
 	dev->p->driver_data = data;
-	return 0;
 }
 EXPORT_SYMBOL(dev_set_drvdata);

@@ -53,6 +53,9 @@
 #define S3C2410_UERSTAT	  (0x14)
 #define S3C2410_UFSTAT	  (0x18)
 #define S3C2410_UMSTAT	  (0x1C)
+#define S3C2410_UBRDIV	  (0x28)
+#define S3C2410_UDIVSLOT  (0x2C)
+#define S3C2410_UINTMSK   (0x38)
 
 #define S3C2410_LCON_CFGMASK	  ((0xF<<3)|(0x3))
 
@@ -194,7 +197,12 @@
 #define S3C64XX_UINTSP		0x34
 #define S3C64XX_UINTM		0x38
 
-/* Following are specific to S5PV210 */
+/* S5V210 interrupt registers. */
+#define S5P_UINTP		0x30
+#define S5P_UINTSP		0x34
+#define S5P_UINTM		0x38
+
+/* Following are specific to S5PV210 and S5P6442 */
 #define S5PV210_UCON_CLKMASK	(1<<10)
 #define S5PV210_UCON_PCLK	(0<<10)
 #define S5PV210_UCON_UCLK	(1<<10)
@@ -223,8 +231,6 @@
 #define S5PV210_UFSTAT_TXSHIFT	(16)
 #define S5PV210_UFSTAT_RXMASK	(255<<0)
 #define S5PV210_UFSTAT_RXSHIFT	(0)
-
-#define NO_NEED_CHECK_CLKSRC	1
 
 #ifndef __ASSEMBLY__
 
@@ -259,9 +265,11 @@ struct s3c2410_uartcfg {
 	unsigned char	   hwport;	 /* hardware port number */
 	unsigned char	   unused;
 	unsigned short	   flags;
+#if !defined(CONFIG_CPU_S5PV210)
 	upf_t		   uart_flags;	 /* default uart flags */
-
-	unsigned int	   has_fracval;
+#else
+        unsigned long	   uart_flags;      /* default uart flags */
+#endif
 
 	unsigned long	   ucon;	 /* value of ucon for port */
 	unsigned long	   ulcon;	 /* value of ulcon for port */
@@ -269,6 +277,8 @@ struct s3c2410_uartcfg {
 
 	struct s3c24xx_uart_clksrc *clocks;
 	unsigned int		    clocks_size;
+
+	void (*wake_peer)(struct uart_port *);
 };
 
 /* s3c24xx_uart_devs

@@ -47,7 +47,10 @@ static inline unsigned long size_inside_page(unsigned long start,
 #ifndef ARCH_HAS_VALID_PHYS_ADDR_RANGE
 static inline int valid_phys_addr_range(unsigned long addr, size_t count)
 {
-	return addr + count <= __pa(high_memory);
+	if (addr + count > __pa(high_memory))
+		return 0;
+
+	return 1;
 }
 
 static inline int valid_mmap_phys_addr_range(unsigned long pfn, size_t size)
@@ -56,6 +59,7 @@ static inline int valid_mmap_phys_addr_range(unsigned long pfn, size_t size)
 }
 #endif
 
+#if defined(CONFIG_DEVMEM) || defined(CONFIG_DEVKMEM)
 #ifdef CONFIG_STRICT_DEVMEM
 static inline int range_is_allowed(unsigned long pfn, unsigned long size)
 {
@@ -81,7 +85,9 @@ static inline int range_is_allowed(unsigned long pfn, unsigned long size)
 	return 1;
 }
 #endif
+#endif
 
+#ifdef CONFIG_DEVMEM
 void __weak unxlate_dev_mem_ptr(unsigned long phys, void *addr)
 {
 }
@@ -208,6 +214,9 @@ static ssize_t write_mem(struct file *file, const char __user *buf,
 	*ppos += written;
 	return written;
 }
+#endif	/* CONFIG_DEVMEM */
+
+#if defined(CONFIG_DEVMEM) || defined(CONFIG_DEVKMEM)
 
 int __weak phys_mem_access_prot_allowed(struct file *file,
 	unsigned long pfn, unsigned long size, pgprot_t *vma_prot)
@@ -329,6 +338,7 @@ static int mmap_mem(struct file *file, struct vm_area_struct *vma)
 	}
 	return 0;
 }
+#endif	/* CONFIG_DEVMEM */
 
 #ifdef CONFIG_DEVKMEM
 static int mmap_kmem(struct file *file, struct vm_area_struct *vma)
@@ -693,6 +703,8 @@ static loff_t null_lseek(struct file *file, loff_t offset, int orig)
 	return file->f_pos = 0;
 }
 
+#if defined(CONFIG_DEVMEM) || defined(CONFIG_DEVKMEM) || defined(CONFIG_DEVPORT)
+
 /*
  * The memory devices use the full 32/64 bits of the offset, and so we cannot
  * check against negative addresses: they are ok. The return value is weird,
@@ -726,10 +738,14 @@ static loff_t memory_lseek(struct file *file, loff_t offset, int orig)
 	return ret;
 }
 
+#endif
+
+#if defined(CONFIG_DEVMEM) || defined(CONFIG_DEVKMEM) || defined(CONFIG_DEVPORT)
 static int open_port(struct inode * inode, struct file * filp)
 {
 	return capable(CAP_SYS_RAWIO) ? 0 : -EPERM;
 }
+#endif
 
 #define zero_lseek	null_lseek
 #define full_lseek      null_lseek
@@ -739,6 +755,7 @@ static int open_port(struct inode * inode, struct file * filp)
 #define open_kmem	open_mem
 #define open_oldmem	open_mem
 
+#ifdef CONFIG_DEVMEM
 static const struct file_operations mem_fops = {
 	.llseek		= memory_lseek,
 	.read		= read_mem,
@@ -747,6 +764,7 @@ static const struct file_operations mem_fops = {
 	.open		= open_mem,
 	.get_unmapped_area = get_unmapped_area_mem,
 };
+#endif
 
 #ifdef CONFIG_DEVKMEM
 static const struct file_operations kmem_fops = {
@@ -802,46 +820,42 @@ static const struct file_operations full_fops = {
 static const struct file_operations oldmem_fops = {
 	.read	= read_oldmem,
 	.open	= open_oldmem,
-	.llseek = default_llseek,
 };
 #endif
 
-static ssize_t kmsg_writev(struct kiocb *iocb, const struct iovec *iv,
-			   unsigned long count, loff_t pos)
+#ifdef CONFIG_S3C_MEM
+extern int s3c_mem_mmap(struct file* filp, struct vm_area_struct *vma);
+extern int s3c_mem_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg);
+
+static const struct file_operations s3c_mem_fops = {
+	.ioctl	= s3c_mem_ioctl,
+	.mmap	= s3c_mem_mmap,
+};
+#endif
+
+static ssize_t kmsg_write(struct file *file, const char __user *buf,
+			  size_t count, loff_t *ppos)
 {
-	char *line, *p;
-	int i;
-	ssize_t ret = -EFAULT;
-	size_t len = iov_length(iv, count);
+	char *tmp;
+	ssize_t ret;
 
-	line = kmalloc(len + 1, GFP_KERNEL);
-	if (line == NULL)
+	tmp = kmalloc(count + 1, GFP_KERNEL);
+	if (tmp == NULL)
 		return -ENOMEM;
-
-	/*
-	 * copy all vectors into a single string, to ensure we do
-	 * not interleave our log line with other printk calls
-	 */
-	p = line;
-	for (i = 0; i < count; i++) {
-		if (copy_from_user(p, iv[i].iov_base, iv[i].iov_len))
-			goto out;
-		p += iv[i].iov_len;
+	ret = -EFAULT;
+	if (!copy_from_user(tmp, buf, count)) {
+		tmp[count] = 0;
+		ret = printk("%s", tmp);
+		if (ret > count)
+			/* printk can add a prefix */
+			ret = count;
 	}
-	p[0] = '\0';
-
-	ret = printk("%s", line);
-	/* printk can add a prefix */
-	if (ret > len)
-		ret = len;
-out:
-	kfree(line);
+	kfree(tmp);
 	return ret;
 }
 
 static const struct file_operations kmsg_fops = {
-	.aio_write = kmsg_writev,
-	.llseek = noop_llseek,
+	.write = kmsg_write,
 };
 
 static const struct memdev {
@@ -850,7 +864,9 @@ static const struct memdev {
 	const struct file_operations *fops;
 	struct backing_dev_info *dev_info;
 } devlist[] = {
+#ifdef CONFIG_DEVMEM
 	 [1] = { "mem", 0, &mem_fops, &directly_mappable_cdev_bdi },
+#endif
 #ifdef CONFIG_DEVKMEM
 	 [2] = { "kmem", 0, &kmem_fops, &directly_mappable_cdev_bdi },
 #endif
@@ -865,6 +881,9 @@ static const struct memdev {
 	[11] = { "kmsg", 0, &kmsg_fops, NULL },
 #ifdef CONFIG_CRASH_DUMP
 	[12] = { "oldmem", 0, &oldmem_fops, NULL },
+#endif
+#ifdef CONFIG_S3C_MEM
+	[13] = {"s3c-mem", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH, &s3c_mem_fops},
 #endif
 };
 
@@ -885,10 +904,6 @@ static int memory_open(struct inode *inode, struct file *filp)
 	if (dev->dev_info)
 		filp->f_mapping->backing_dev_info = dev->dev_info;
 
-	/* Is /dev/mem or /dev/kmem ? */
-	if (dev->dev_info == &directly_mappable_cdev_bdi)
-		filp->f_mode |= FMODE_UNSIGNED_OFFSET;
-
 	if (dev->fops->open)
 		return dev->fops->open(inode, filp);
 
@@ -897,7 +912,6 @@ static int memory_open(struct inode *inode, struct file *filp)
 
 static const struct file_operations memory_fops = {
 	.open = memory_open,
-	.llseek = noop_llseek,
 };
 
 static char *mem_devnode(struct device *dev, mode_t *mode)

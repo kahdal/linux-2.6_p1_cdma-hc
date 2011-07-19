@@ -31,6 +31,7 @@ static int show_stat(struct seq_file *p, void *v)
 	u64 sum_softirq = 0;
 	unsigned int per_softirq_sums[NR_SOFTIRQS] = {0};
 	struct timespec boottime;
+	unsigned int per_irq_sum;
 
 	user = nice = system = idle = iowait =
 		irq = softirq = steal = cputime64_zero;
@@ -51,7 +52,9 @@ static int show_stat(struct seq_file *p, void *v)
 		guest = cputime64_add(guest, kstat_cpu(i).cpustat.guest);
 		guest_nice = cputime64_add(guest_nice,
 			kstat_cpu(i).cpustat.guest_nice);
-		sum += kstat_cpu_irqs_sum(i);
+		for_each_irq_nr(j) {
+			sum += kstat_irqs_cpu(j, i);
+		}
 		sum += arch_irq_stat_cpu(i);
 
 		for (j = 0; j < NR_SOFTIRQS; j++) {
@@ -107,8 +110,13 @@ static int show_stat(struct seq_file *p, void *v)
 	seq_printf(p, "intr %llu", (unsigned long long)sum);
 
 	/* sum again ? it could be updated? */
-	for_each_irq_nr(j)
-		seq_printf(p, " %u", kstat_irqs(j));
+	for_each_irq_nr(j) {
+		per_irq_sum = 0;
+		for_each_possible_cpu(i)
+			per_irq_sum += kstat_irqs_cpu(j, i);
+
+		seq_printf(p, " %u", per_irq_sum);
+	}
 
 	seq_printf(p,
 		"\nctxt %llu\n"
@@ -126,7 +134,7 @@ static int show_stat(struct seq_file *p, void *v)
 
 	for (i = 0; i < NR_SOFTIRQS; i++)
 		seq_printf(p, " %u", per_softirq_sums[i]);
-	seq_putc(p, '\n');
+	seq_printf(p, "\n");
 
 	return 0;
 }
@@ -138,9 +146,9 @@ static int stat_open(struct inode *inode, struct file *file)
 	struct seq_file *m;
 	int res;
 
-	/* don't ask for more than the kmalloc() max size */
-	if (size > KMALLOC_MAX_SIZE)
-		size = KMALLOC_MAX_SIZE;
+	/* don't ask for more than the kmalloc() max size, currently 128 KB */
+	if (size > 128 * 1024)
+		size = 128 * 1024;
 	buf = kmalloc(size, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;

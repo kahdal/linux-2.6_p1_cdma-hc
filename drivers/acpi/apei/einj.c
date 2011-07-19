@@ -39,7 +39,7 @@
 #define EINJ_PFX "EINJ: "
 
 #define SPIN_UNIT		100			/* 100ns */
-/* Firmware should respond within 1 milliseconds */
+/* Firmware should respond within 1 miliseconds */
 #define FIRMWARE_TIMEOUT	(1 * NSEC_PER_MSEC)
 
 /*
@@ -100,14 +100,6 @@ static struct apei_exec_ins_type einj_ins_type[] = {
 static DEFINE_MUTEX(einj_mutex);
 
 static struct einj_parameter *einj_param;
-
-#ifndef writeq
-static inline void writeq(__u64 val, volatile void __iomem *addr)
-{
-	writel(val, addr);
-	writel(val >> 32, addr+4);
-}
-#endif
 
 static void einj_exec_ctx_init(struct apei_exec_context *ctx)
 {
@@ -434,9 +426,7 @@ DEFINE_SIMPLE_ATTRIBUTE(error_inject_fops, NULL,
 
 static int einj_check_table(struct acpi_table_einj *einj_tab)
 {
-	if ((einj_tab->header_length !=
-	     (sizeof(struct acpi_table_einj) - sizeof(einj_tab->header)))
-	    && (einj_tab->header_length != sizeof(struct acpi_table_einj)))
+	if (einj_tab->header_length != sizeof(struct acpi_table_einj))
 		return -EINVAL;
 	if (einj_tab->header.length < sizeof(struct acpi_table_einj))
 		return -EINVAL;

@@ -129,6 +129,7 @@ static struct net_device *dev_lec[MAX_LEC_ITF];
 #if defined(CONFIG_BRIDGE) || defined(CONFIG_BRIDGE_MODULE)
 static void lec_handle_bridge(struct sk_buff *skb, struct net_device *dev)
 {
+	struct ethhdr *eth;
 	char *buff;
 	struct lec_priv *priv;
 
@@ -137,6 +138,7 @@ static void lec_handle_bridge(struct sk_buff *skb, struct net_device *dev)
 	 * LE_TOPOLOGY_REQUEST with the same value of Topology Change bit
 	 * as the Config BPDU has
 	 */
+	eth = (struct ethhdr *)skb->data;
 	buff = skb->data + skb->dev->hard_header_len;
 	if (*buff++ == 0x42 && *buff++ == 0x42 && *buff++ == 0x03) {
 		struct sock *sk;
@@ -218,6 +220,7 @@ static unsigned char *get_tr_dst(unsigned char *packet, unsigned char *rdesc)
 static int lec_open(struct net_device *dev)
 {
 	netif_start_queue(dev);
+	memset(&dev->stats, 0, sizeof(struct net_device_stats));
 
 	return 0;
 }
@@ -814,7 +817,8 @@ static int lec_mcast_attach(struct atm_vcc *vcc, int arg)
 	if (arg < 0 || arg >= MAX_LEC_ITF || !dev_lec[arg])
 		return -EINVAL;
 	vcc->proto_data = dev_lec[arg];
-	return lec_mcast_make(netdev_priv(dev_lec[arg]), vcc);
+	return lec_mcast_make((struct lec_priv *)netdev_priv(dev_lec[arg]),
+				vcc);
 }
 
 /* Initialize device. */
@@ -1171,13 +1175,14 @@ static int __init lane_module_init(void)
 #endif
 
 	register_atm_ioctl(&lane_ioctl_ops);
-	pr_info("lec.c: initialized\n");
+	pr_info("lec.c: " __DATE__ " " __TIME__ " initialized\n");
 	return 0;
 }
 
 static void __exit lane_module_cleanup(void)
 {
 	int i;
+	struct lec_priv *priv;
 
 	remove_proc_entry("lec", atm_proc_root);
 
@@ -1185,6 +1190,7 @@ static void __exit lane_module_cleanup(void)
 
 	for (i = 0; i < MAX_LEC_ITF; i++) {
 		if (dev_lec[i] != NULL) {
+			priv = netdev_priv(dev_lec[i]);
 			unregister_netdev(dev_lec[i]);
 			free_netdev(dev_lec[i]);
 			dev_lec[i] = NULL;
@@ -1603,7 +1609,7 @@ static void lec_arp_destroy(struct lec_priv *priv)
 	struct lec_arp_table *entry;
 	int i;
 
-	cancel_delayed_work_sync(&priv->lec_arp_work);
+	cancel_rearming_delayed_work(&priv->lec_arp_work);
 
 	/*
 	 * Remove all entries

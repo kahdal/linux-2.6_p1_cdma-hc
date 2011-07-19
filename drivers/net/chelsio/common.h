@@ -264,6 +264,11 @@ struct adapter {
 
 enum {                                           /* adapter flags */
 	FULL_INIT_DONE        = 1 << 0,
+	TSO_CAPABLE           = 1 << 2,
+	TCP_CSUM_CAPABLE      = 1 << 3,
+	UDP_CSUM_CAPABLE      = 1 << 4,
+	VLAN_ACCEL_CAPABLE    = 1 << 5,
+	RX_CSUM_ENABLED       = 1 << 6,
 };
 
 struct mdio_ops;
@@ -281,6 +286,7 @@ struct board_info {
 	unsigned int            clock_mc3;
 	unsigned int            clock_mc4;
 	unsigned int            espi_nports;
+	unsigned int            clock_cspi;
 	unsigned int            clock_elmer0;
 	unsigned char           mdio_mdien;
 	unsigned char           mdio_mdiinv;

@@ -19,8 +19,6 @@
 
 ======================================================================*/
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
 #define DRV_NAME	"3c589_cs"
 #define DRV_VERSION	"1.162-ac"
 
@@ -43,6 +41,8 @@
 #include <linux/bitops.h>
 #include <linux/jiffies.h>
 
+#include <pcmcia/cs_types.h>
+#include <pcmcia/cs.h>
 #include <pcmcia/cistpl.h>
 #include <pcmcia/cisreg.h>
 #include <pcmcia/ciscode.h>
@@ -177,6 +177,14 @@ static const struct ethtool_ops netdev_ethtool_ops;
 
 static void tc589_detach(struct pcmcia_device *p_dev);
 
+/*======================================================================
+
+    tc589_attach() creates an "instance" of the driver, allocating
+    local data structures for one device.  The device is registered
+    with Card Services.
+
+======================================================================*/
+
 static const struct net_device_ops el3_netdev_ops = {
 	.ndo_open		= el3_open,
 	.ndo_stop		= el3_close,
@@ -206,11 +214,12 @@ static int tc589_probe(struct pcmcia_device *link)
     lp->p_dev = link;
 
     spin_lock_init(&lp->lock);
-    link->resource[0]->end = 16;
-    link->resource[0]->flags |= IO_DATA_PATH_WIDTH_16;
+    link->io.NumPorts1 = 16;
+    link->io.Attributes1 = IO_DATA_PATH_WIDTH_16;
 
-    link->config_flags |= CONF_ENABLE_IRQ;
-    link->config_index = 1;
+    link->conf.Attributes = CONF_ENABLE_IRQ;
+    link->conf.IntType = INT_MEMORY_AND_IO;
+    link->conf.ConfigIndex = 1;
 
     dev->netdev_ops = &el3_netdev_ops;
     dev->watchdog_timeo = TX_TIMEOUT;
@@ -218,7 +227,16 @@ static int tc589_probe(struct pcmcia_device *link)
     SET_ETHTOOL_OPS(dev, &netdev_ethtool_ops);
 
     return tc589_config(link);
-}
+} /* tc589_attach */
+
+/*======================================================================
+
+    This deletes a driver "instance".  The device is de-registered
+    with Card Services.  If it has been released, all local data
+    structures are freed.  Otherwise, the structures will be freed
+    when the device is released.
+
+======================================================================*/
 
 static void tc589_detach(struct pcmcia_device *link)
 {
@@ -233,13 +251,21 @@ static void tc589_detach(struct pcmcia_device *link)
     free_netdev(dev);
 } /* tc589_detach */
 
+/*======================================================================
+
+    tc589_config() is scheduled to run after a CARD_INSERTION event
+    is received, to configure the PCMCIA socket, and to make the
+    ethernet device available to the system.
+
+======================================================================*/
+
 static int tc589_config(struct pcmcia_device *link)
 {
     struct net_device *dev = link->priv;
     __be16 *phys_addr;
     int ret, i, j, multi = 0, fifo;
     unsigned int ioaddr;
-    static const char * const ram_split[] = {"5:3", "3:1", "1:1", "3:5"};
+    char *ram_split[] = {"5:3", "3:1", "1:1", "3:5"};
     u8 *buf;
     size_t len;
 
@@ -248,16 +274,16 @@ static int tc589_config(struct pcmcia_device *link)
     phys_addr = (__be16 *)dev->dev_addr;
     /* Is this a 3c562? */
     if (link->manf_id != MANFID_3COM)
-	    dev_info(&link->dev, "hmmm, is this really a 3Com card??\n");
+	    printk(KERN_INFO "3c589_cs: hmmm, is this really a "
+		   "3Com card??\n");
     multi = (link->card_id == PRODID_3COM_3C562);
 
-    link->io_lines = 16;
-
     /* For the 3c562, the base address must be xx00-xx7f */
+    link->io.IOAddrLines = 16;
     for (i = j = 0; j < 0x400; j += 0x10) {
 	if (multi && (j & 0x80)) continue;
-	link->resource[0]->start = j ^ 0x300;
-	i = pcmcia_request_io(link);
+	link->io.BasePort1 = j ^ 0x300;
+	i = pcmcia_request_io(link, &link->io);
 	if (i == 0)
 		break;
     }
@@ -268,12 +294,12 @@ static int tc589_config(struct pcmcia_device *link)
     if (ret)
 	    goto failed;
 
-    ret = pcmcia_enable_device(link);
+    ret = pcmcia_request_configuration(link, &link->conf);
     if (ret)
 	    goto failed;
 
     dev->irq = link->irq;
-    dev->base_addr = link->resource[0]->start;
+    dev->base_addr = link->io.BasePort1;
     ioaddr = dev->base_addr;
     EL3WINDOW(0);
 
@@ -289,8 +315,8 @@ static int tc589_config(struct pcmcia_device *link)
 	for (i = 0; i < 3; i++)
 	    phys_addr[i] = htons(read_eeprom(ioaddr, i));
 	if (phys_addr[0] == htons(0x6060)) {
-	    dev_err(&link->dev, "IO port conflict at 0x%03lx-0x%03lx\n",
-		    dev->base_addr, dev->base_addr+15);
+	    printk(KERN_ERR "3c589_cs: IO port conflict at 0x%03lx"
+		   "-0x%03lx\n", dev->base_addr, dev->base_addr+15);
 	    goto failed;
 	}
     }
@@ -304,12 +330,12 @@ static int tc589_config(struct pcmcia_device *link)
     if ((if_port >= 0) && (if_port <= 3))
 	dev->if_port = if_port;
     else
-	dev_err(&link->dev, "invalid if_port requested\n");
+	printk(KERN_ERR "3c589_cs: invalid if_port requested\n");
 
     SET_NETDEV_DEV(dev, &link->dev);
 
     if (register_netdev(dev) != 0) {
-	    dev_err(&link->dev, "register_netdev() failed\n");
+	printk(KERN_ERR "3c589_cs: register_netdev() failed\n");
 	goto failed;
     }
 
@@ -325,6 +351,14 @@ failed:
     tc589_release(link);
     return -ENODEV;
 } /* tc589_config */
+
+/*======================================================================
+
+    After a card is removed, tc589_release() will unregister the net
+    device, and release the PCMCIA configuration.  If the device is
+    still open, this will be postponed until it is closed.
+
+======================================================================*/
 
 static void tc589_release(struct pcmcia_device *link)
 {
@@ -503,7 +537,7 @@ static int el3_open(struct net_device *dev)
 
     tc589_reset(dev);
     init_timer(&lp->media);
-    lp->media.function = media_check;
+    lp->media.function = &media_check;
     lp->media.data = (unsigned long) dev;
     lp->media.expires = jiffies + HZ;
     add_timer(&lp->media);
@@ -908,7 +942,7 @@ static int el3_close(struct net_device *dev)
     return 0;
 }
 
-static const struct pcmcia_device_id tc589_ids[] = {
+static struct pcmcia_device_id tc589_ids[] = {
 	PCMCIA_MFC_DEVICE_MANF_CARD(0, 0x0101, 0x0562),
 	PCMCIA_MFC_DEVICE_PROD_ID1(0, "Motorola MARQUIS", 0xf03e4e77),
 	PCMCIA_DEVICE_MANF_CARD(0x0101, 0x0589),
@@ -921,7 +955,9 @@ MODULE_DEVICE_TABLE(pcmcia, tc589_ids);
 
 static struct pcmcia_driver tc589_driver = {
 	.owner		= THIS_MODULE,
-	.name		= "3c589_cs",
+	.drv		= {
+		.name	= "3c589_cs",
+	},
 	.probe		= tc589_probe,
 	.remove		= tc589_detach,
 	.id_table	= tc589_ids,

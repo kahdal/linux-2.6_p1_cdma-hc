@@ -16,34 +16,21 @@
  * While the GPIO programming interface defines valid GPIO numbers
  * to be in the range 0..MAX_INT, this library restricts them to the
  * smaller range 0..ARCH_NR_GPIOS-1.
- *
- * ARCH_NR_GPIOS is somewhat arbitrary; it usually reflects the sum of
- * builtin/SoC GPIOs plus a number of GPIOs on expanders; the latter is
- * actually an estimate of a board-specific value.
  */
 
 #ifndef ARCH_NR_GPIOS
 #define ARCH_NR_GPIOS		256
 #endif
 
-/*
- * "valid" GPIO numbers are nonnegative and may be passed to
- * setup routines like gpio_request().  only some valid numbers
- * can successfully be requested and used.
- *
- * Invalid GPIO numbers are useful for indicating no-such-GPIO in
- * platform data and other tables.
- */
-
-static inline bool gpio_is_valid(int number)
+static inline int gpio_is_valid(int number)
 {
-	return number >= 0 && number < ARCH_NR_GPIOS;
+	/* only some non-negative numbers are valid */
+	return ((unsigned)number) < ARCH_NR_GPIOS;
 }
 
 struct device;
 struct seq_file;
 struct module;
-struct device_node;
 
 /**
  * struct gpio_chip - abstract a GPIO controller
@@ -119,17 +106,6 @@ struct gpio_chip {
 	const char		*const *names;
 	unsigned		can_sleep:1;
 	unsigned		exported:1;
-
-#if defined(CONFIG_OF_GPIO)
-	/*
-	 * If CONFIG_OF is enabled, then all GPIO controllers described in the
-	 * device tree automatically may have an OF translation
-	 */
-	struct device_node *of_node;
-	int of_gpio_n_cells;
-	int (*of_xlate)(struct gpio_chip *gc, struct device_node *np,
-		        const void *gpio_spec, u32 *flags);
-#endif
 };
 
 extern const char *gpiochip_is_requested(struct gpio_chip *chip,
@@ -139,9 +115,6 @@ extern int __must_check gpiochip_reserve(int start, int ngpio);
 /* add/remove chips */
 extern int gpiochip_add(struct gpio_chip *chip);
 extern int __must_check gpiochip_remove(struct gpio_chip *chip);
-extern struct gpio_chip *gpiochip_find(void *data,
-					int (*match)(struct gpio_chip *chip,
-						     void *data));
 
 
 /* Always use the library code for GPIO management calls,
@@ -170,6 +143,16 @@ extern int __gpio_cansleep(unsigned gpio);
 
 extern int __gpio_to_irq(unsigned gpio);
 
+#define GPIOF_DIR_OUT	(0 << 0)
+#define GPIOF_DIR_IN	(1 << 0)
+
+#define GPIOF_INIT_LOW	(0 << 1)
+#define GPIOF_INIT_HIGH	(1 << 1)
+
+#define GPIOF_IN		(GPIOF_DIR_IN)
+#define GPIOF_OUT_INIT_LOW	(GPIOF_DIR_OUT | GPIOF_INIT_LOW)
+#define GPIOF_OUT_INIT_HIGH	(GPIOF_DIR_OUT | GPIOF_INIT_HIGH)
+
 /**
  * struct gpio - a structure describing a GPIO with configuration
  * @gpio:	the GPIO number
@@ -183,8 +166,8 @@ struct gpio {
 };
 
 extern int gpio_request_one(unsigned gpio, unsigned long flags, const char *label);
-extern int gpio_request_array(const struct gpio *array, size_t num);
-extern void gpio_free_array(const struct gpio *array, size_t num);
+extern int gpio_request_array(struct gpio *array, size_t num);
+extern void gpio_free_array(struct gpio *array, size_t num);
 
 #ifdef CONFIG_GPIO_SYSFS
 
@@ -200,9 +183,9 @@ extern void gpio_unexport(unsigned gpio);
 
 #endif	/* CONFIG_GPIO_SYSFS */
 
-#else	/* !CONFIG_GPIOLIB */
+#else	/* !CONFIG_HAVE_GPIO_LIB */
 
-static inline bool gpio_is_valid(int number)
+static inline int gpio_is_valid(int number)
 {
 	/* only non-negative numbers are valid */
 	return number >= 0;
@@ -229,7 +212,7 @@ static inline void gpio_set_value_cansleep(unsigned gpio, int value)
 	gpio_set_value(gpio, value);
 }
 
-#endif /* !CONFIG_GPIOLIB */
+#endif /* !CONFIG_HAVE_GPIO_LIB */
 
 #ifndef CONFIG_GPIO_SYSFS
 

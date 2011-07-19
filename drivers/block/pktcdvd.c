@@ -85,7 +85,6 @@
 
 #define ZONE(sector, pd) (((sector) + (pd)->offset) & ~((pd)->settings.size - 1))
 
-static DEFINE_MUTEX(pktcdvd_mutex);
 static struct pktcdvd_device *pkt_devs[MAX_WRITERS];
 static struct proc_dir_entry *pkt_proc;
 static int pktdev_major;
@@ -753,6 +752,7 @@ static int pkt_generic_packet(struct pktcdvd_device *pd, struct packet_command *
 
 	rq->timeout = 60*HZ;
 	rq->cmd_type = REQ_TYPE_BLOCK_PC;
+	rq->cmd_flags |= REQ_HARDBARRIER;
 	if (cgc->quiet)
 		rq->cmd_flags |= REQ_QUIET;
 
@@ -1221,7 +1221,7 @@ static int pkt_start_recovery(struct packet_data *pkt)
 	pkt->bio->bi_flags = 1 << BIO_UPTODATE;
 	pkt->bio->bi_idx = 0;
 
-	BUG_ON(pkt->bio->bi_rw != REQ_WRITE);
+	BUG_ON(pkt->bio->bi_rw != (1 << BIO_RW));
 	BUG_ON(pkt->bio->bi_vcnt != pkt->frames);
 	BUG_ON(pkt->bio->bi_size != pkt->frames * CD_FRAMESIZE);
 	BUG_ON(pkt->bio->bi_end_io != pkt_end_io_packet_write);
@@ -1605,6 +1605,8 @@ static int kcdrwd(void *foobar)
 				if (pkt->sleep_time && pkt->sleep_time < min_sleep_time)
 					min_sleep_time = pkt->sleep_time;
 			}
+
+			generic_unplug_device(bdev_get_queue(pd->bdev));
 
 			VPRINTK("kcdrwd: sleeping\n");
 			residue = schedule_timeout(min_sleep_time);
@@ -2294,12 +2296,15 @@ static int pkt_open_dev(struct pktcdvd_device *pd, fmode_t write)
 	 * so bdget() can't fail.
 	 */
 	bdget(pd->bdev->bd_dev);
-	if ((ret = blkdev_get(pd->bdev, FMODE_READ | FMODE_EXCL, pd)))
+	if ((ret = blkdev_get(pd->bdev, FMODE_READ)))
 		goto out;
+
+	if ((ret = bd_claim(pd->bdev, pd)))
+		goto out_putdev;
 
 	if ((ret = pkt_get_last_written(pd, &lba))) {
 		printk(DRIVER_NAME": pkt_get_last_written failed\n");
-		goto out_putdev;
+		goto out_unclaim;
 	}
 
 	set_capacity(pd->disk, lba << 2);
@@ -2309,7 +2314,7 @@ static int pkt_open_dev(struct pktcdvd_device *pd, fmode_t write)
 	q = bdev_get_queue(pd->bdev);
 	if (write) {
 		if ((ret = pkt_open_write(pd)))
-			goto out_putdev;
+			goto out_unclaim;
 		/*
 		 * Some CDRW drives can not handle writes larger than one packet,
 		 * even if the size is a multiple of the packet size.
@@ -2324,21 +2329,23 @@ static int pkt_open_dev(struct pktcdvd_device *pd, fmode_t write)
 	}
 
 	if ((ret = pkt_set_segment_merging(pd, q)))
-		goto out_putdev;
+		goto out_unclaim;
 
 	if (write) {
 		if (!pkt_grow_pktlist(pd, CONFIG_CDROM_PKTCDVD_BUFFERS)) {
 			printk(DRIVER_NAME": not enough memory for buffers\n");
 			ret = -ENOMEM;
-			goto out_putdev;
+			goto out_unclaim;
 		}
 		printk(DRIVER_NAME": %lukB available on disc\n", lba << 1);
 	}
 
 	return 0;
 
+out_unclaim:
+	bd_release(pd->bdev);
 out_putdev:
-	blkdev_put(pd->bdev, FMODE_READ | FMODE_EXCL);
+	blkdev_put(pd->bdev, FMODE_READ);
 out:
 	return ret;
 }
@@ -2355,12 +2362,13 @@ static void pkt_release_dev(struct pktcdvd_device *pd, int flush)
 	pkt_lock_door(pd, 0);
 
 	pkt_set_speed(pd, MAX_SPEED, MAX_SPEED);
-	blkdev_put(pd->bdev, FMODE_READ | FMODE_EXCL);
+	bd_release(pd->bdev);
+	blkdev_put(pd->bdev, FMODE_READ);
 
 	pkt_shrink_pktlist(pd);
 }
 
-static struct pktcdvd_device *pkt_find_dev_from_minor(unsigned int dev_minor)
+static struct pktcdvd_device *pkt_find_dev_from_minor(int dev_minor)
 {
 	if (dev_minor >= MAX_WRITERS)
 		return NULL;
@@ -2374,7 +2382,6 @@ static int pkt_open(struct block_device *bdev, fmode_t mode)
 
 	VPRINTK(DRIVER_NAME": entering open\n");
 
-	mutex_lock(&pktcdvd_mutex);
 	mutex_lock(&ctl_mutex);
 	pd = pkt_find_dev_from_minor(MINOR(bdev->bd_dev));
 	if (!pd) {
@@ -2402,7 +2409,6 @@ static int pkt_open(struct block_device *bdev, fmode_t mode)
 	}
 
 	mutex_unlock(&ctl_mutex);
-	mutex_unlock(&pktcdvd_mutex);
 	return 0;
 
 out_dec:
@@ -2410,7 +2416,6 @@ out_dec:
 out:
 	VPRINTK(DRIVER_NAME": failed open (%d)\n", ret);
 	mutex_unlock(&ctl_mutex);
-	mutex_unlock(&pktcdvd_mutex);
 	return ret;
 }
 
@@ -2419,7 +2424,6 @@ static int pkt_close(struct gendisk *disk, fmode_t mode)
 	struct pktcdvd_device *pd = disk->private_data;
 	int ret = 0;
 
-	mutex_lock(&pktcdvd_mutex);
 	mutex_lock(&ctl_mutex);
 	pd->refcnt--;
 	BUG_ON(pd->refcnt < 0);
@@ -2428,7 +2432,6 @@ static int pkt_close(struct gendisk *disk, fmode_t mode)
 		pkt_release_dev(pd, flush);
 	}
 	mutex_unlock(&ctl_mutex);
-	mutex_unlock(&pktcdvd_mutex);
 	return ret;
 }
 
@@ -2725,7 +2728,7 @@ static int pkt_new_dev(struct pktcdvd_device *pd, dev_t dev)
 	bdev = bdget(dev);
 	if (!bdev)
 		return -ENOMEM;
-	ret = blkdev_get(bdev, FMODE_READ | FMODE_NDELAY, NULL);
+	ret = blkdev_get(bdev, FMODE_READ | FMODE_NDELAY);
 	if (ret)
 		return ret;
 
@@ -2759,12 +2762,10 @@ out_mem:
 static int pkt_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg)
 {
 	struct pktcdvd_device *pd = bdev->bd_disk->private_data;
-	int ret;
 
 	VPRINTK("pkt_ioctl: cmd %x, dev %d:%d\n", cmd,
 		MAJOR(bdev->bd_dev), MINOR(bdev->bd_dev));
 
-	mutex_lock(&pktcdvd_mutex);
 	switch (cmd) {
 	case CDROMEJECT:
 		/*
@@ -2782,20 +2783,17 @@ static int pkt_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, 
 	case CDROM_LAST_WRITTEN:
 	case CDROM_SEND_PACKET:
 	case SCSI_IOCTL_SEND_COMMAND:
-		ret = __blkdev_driver_ioctl(pd->bdev, mode, cmd, arg);
-		break;
+		return __blkdev_driver_ioctl(pd->bdev, mode, cmd, arg);
 
 	default:
 		VPRINTK(DRIVER_NAME": Unknown ioctl for %s (%x)\n", pd->name, cmd);
-		ret = -ENOTTY;
+		return -ENOTTY;
 	}
-	mutex_unlock(&pktcdvd_mutex);
 
-	return ret;
+	return 0;
 }
 
-static unsigned int pkt_check_events(struct gendisk *disk,
-				     unsigned int clearing)
+static int pkt_media_changed(struct gendisk *disk)
 {
 	struct pktcdvd_device *pd = disk->private_data;
 	struct gendisk *attached_disk;
@@ -2805,17 +2803,17 @@ static unsigned int pkt_check_events(struct gendisk *disk,
 	if (!pd->bdev)
 		return 0;
 	attached_disk = pd->bdev->bd_disk;
-	if (!attached_disk || !attached_disk->fops->check_events)
+	if (!attached_disk)
 		return 0;
-	return attached_disk->fops->check_events(attached_disk, clearing);
+	return attached_disk->fops->media_changed(attached_disk);
 }
 
 static const struct block_device_operations pktcdvd_ops = {
 	.owner =		THIS_MODULE,
 	.open =			pkt_open,
 	.release =		pkt_close,
-	.ioctl =		pkt_ioctl,
-	.check_events =		pkt_check_events,
+	.locked_ioctl =		pkt_ioctl,
+	.media_changed =	pkt_media_changed,
 };
 
 static char *pktcdvd_devnode(struct gendisk *gd, mode_t *mode)
@@ -2887,10 +2885,6 @@ static int pkt_setup_dev(dev_t dev, dev_t* pkt_dev)
 	ret = pkt_new_dev(pd, dev);
 	if (ret)
 		goto out_new_dev;
-
-	/* inherit events of the host device */
-	disk->events = pd->bdev->bd_disk->events;
-	disk->async_events = pd->bdev->bd_disk->async_events;
 
 	add_disk(disk);
 
@@ -3042,7 +3036,6 @@ static const struct file_operations pkt_ctl_fops = {
 	.compat_ioctl	= pkt_ctl_compat_ioctl,
 #endif
 	.owner		= THIS_MODULE,
-	.llseek		= no_llseek,
 };
 
 static struct miscdevice pkt_misc = {

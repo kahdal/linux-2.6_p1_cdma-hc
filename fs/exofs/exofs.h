@@ -77,7 +77,7 @@ struct exofs_layout {
  * our extension to the in-memory superblock
  */
 struct exofs_sb_info {
-	struct exofs_sb_stats s_ess;		/* Written often, pre-allocate*/
+	struct exofs_fscb s_fscb;		/* Written often, pre-allocate*/
 	int		s_timeout;		/* timeout for OSD operations */
 	uint64_t	s_nextid;		/* highest object ID used     */
 	uint32_t	s_numfiles;		/* number of files on fs      */
@@ -256,8 +256,7 @@ static inline int exofs_oi_read(struct exofs_i_info *oi,
 }
 
 /* inode.c               */
-unsigned exofs_max_io_pages(struct exofs_layout *layout,
-			    unsigned expected_pages);
+void exofs_truncate(struct inode *inode);
 int exofs_setattr(struct dentry *, struct iattr *);
 int exofs_write_begin(struct file *file, struct address_space *mapping,
 		loff_t pos, unsigned len, unsigned flags,
@@ -265,7 +264,7 @@ int exofs_write_begin(struct file *file, struct address_space *mapping,
 extern struct inode *exofs_iget(struct super_block *, unsigned long);
 struct inode *exofs_new_inode(struct inode *, int);
 extern int exofs_write_inode(struct inode *, struct writeback_control *wbc);
-extern void exofs_evict_inode(struct inode *);
+extern void exofs_delete_inode(struct inode *);
 
 /* dir.c:                */
 int exofs_add_link(struct dentry *, struct inode *);
@@ -281,7 +280,7 @@ int exofs_set_link(struct inode *, struct exofs_dir_entry *, struct page *,
 		    struct inode *);
 
 /* super.c               */
-int exofs_sbi_write_stats(struct exofs_sb_info *sbi);
+int exofs_sync_fs(struct super_block *sb, int wait);
 
 /*********************
  * operation vectors *

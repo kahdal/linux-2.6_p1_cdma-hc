@@ -35,7 +35,6 @@
 #include <linux/tcp.h>
 #include <net/checksum.h>
 #include <linux/inet_lro.h>
-#include <linux/prefetch.h>
 
 #include <asm/irq.h>
 #include <asm/firmware.h>
@@ -809,7 +808,7 @@ static int pasemi_mac_clean_rx(struct pasemi_mac_rxring *rx,
 			skb->csum = (macrx & XCT_MACRX_CSUM_M) >>
 					   XCT_MACRX_CSUM_S;
 		} else
-			skb_checksum_none_assert(skb);
+			skb->ip_summed = CHECKSUM_NONE;
 
 		packets++;
 		tot_bytes += len;

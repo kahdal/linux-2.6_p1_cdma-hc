@@ -24,10 +24,12 @@
 #include "xfs_sb.h"
 #include "xfs_ag.h"
 #include "xfs_dir2.h"
+#include "xfs_dmapi.h"
 #include "xfs_mount.h"
 #include "xfs_da_btree.h"
 #include "xfs_bmap_btree.h"
 #include "xfs_dir2_sf.h"
+#include "xfs_attr_sf.h"
 #include "xfs_dinode.h"
 #include "xfs_inode.h"
 #include "xfs_bmap.h"
@@ -899,9 +901,10 @@ xfs_dir2_leafn_rebalance(
 	if(blk2->index < 0) {
 		state->inleaf = 1;
 		blk2->index = 0;
-		xfs_alert(args->dp->i_mount,
-	"%s: picked the wrong leaf? reverting original leaf: blk1->index %d\n",
-			__func__, blk1->index);
+		cmn_err(CE_ALERT,
+			"xfs_dir2_leafn_rebalance: picked the wrong leaf? reverting original leaf: "
+			"blk1->index %d\n",
+			blk1->index);
 	}
 }
 
@@ -1640,22 +1643,26 @@ xfs_dir2_node_addname_int(
 			}
 
 			if (unlikely(xfs_dir2_db_to_fdb(mp, dbno) != fbno)) {
-				xfs_alert(mp,
-			"%s: dir ino " "%llu needed freesp block %lld for\n"
-			"  data block %lld, got %lld ifbno %llu lastfbno %d",
-					__func__, (unsigned long long)dp->i_ino,
+				cmn_err(CE_ALERT,
+					"xfs_dir2_node_addname_int: dir ino "
+					"%llu needed freesp block %lld for\n"
+					"  data block %lld, got %lld\n"
+					"  ifbno %llu lastfbno %d\n",
+					(unsigned long long)dp->i_ino,
 					(long long)xfs_dir2_db_to_fdb(mp, dbno),
 					(long long)dbno, (long long)fbno,
 					(unsigned long long)ifbno, lastfbno);
 				if (fblk) {
-					xfs_alert(mp,
-				" fblk 0x%p blkno %llu index %d magic 0x%x",
+					cmn_err(CE_ALERT,
+						" fblk 0x%p blkno %llu "
+						"index %d magic 0x%x\n",
 						fblk,
 						(unsigned long long)fblk->blkno,
 						fblk->index,
 						fblk->magic);
 				} else {
-					xfs_alert(mp, " ... fblk is NULL");
+					cmn_err(CE_ALERT,
+						" ... fblk is NULL\n");
 				}
 				XFS_ERROR_REPORT("xfs_dir2_node_addname_int",
 						 XFS_ERRLEVEL_LOW, mp);

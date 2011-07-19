@@ -346,7 +346,7 @@ parse_eeprom (struct net_device *dev)
 	if (np->pdev->vendor == PCI_VENDOR_ID_DLINK) {	/* D-Link Only */
 		/* Check CRC */
 		crc = ~ether_crc_le (256 - 4, sromdata);
-		if (psrom->crc != cpu_to_le32(crc)) {
+		if (psrom->crc != crc) {
 			printk (KERN_ERR "%s: EEPROM data CRC error.\n",
 					dev->name);
 			return -1;
@@ -465,7 +465,7 @@ rio_open (struct net_device *dev)
 	init_timer (&np->timer);
 	np->timer.expires = jiffies + 1*HZ;
 	np->timer.data = (unsigned long) dev;
-	np->timer.function = rio_timer;
+	np->timer.function = &rio_timer;
 	add_timer (&np->timer);
 
 	/* Start Tx/Rx */
@@ -1189,10 +1189,10 @@ static int rio_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 		cmd->transceiver = XCVR_INTERNAL;
 	}
 	if ( np->link_status ) {
-		ethtool_cmd_speed_set(cmd, np->speed);
+		cmd->speed = np->speed;
 		cmd->duplex = np->full_duplex ? DUPLEX_FULL : DUPLEX_HALF;
 	} else {
-		ethtool_cmd_speed_set(cmd, -1);
+		cmd->speed = -1;
 		cmd->duplex = -1;
 	}
 	if ( np->an_enable)
@@ -1219,20 +1219,31 @@ static int rio_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 	} else {
 		np->an_enable = 0;
 		if (np->speed == 1000) {
-			ethtool_cmd_speed_set(cmd, SPEED_100);
+			cmd->speed = SPEED_100;
 			cmd->duplex = DUPLEX_FULL;
 			printk("Warning!! Can't disable Auto negotiation in 1000Mbps, change to Manual 100Mbps, Full duplex.\n");
 		}
-		switch (ethtool_cmd_speed(cmd)) {
-		case SPEED_10:
+		switch(cmd->speed + cmd->duplex) {
+
+		case SPEED_10 + DUPLEX_HALF:
 			np->speed = 10;
-			np->full_duplex = (cmd->duplex == DUPLEX_FULL);
+			np->full_duplex = 0;
 			break;
-		case SPEED_100:
+
+		case SPEED_10 + DUPLEX_FULL:
+			np->speed = 10;
+			np->full_duplex = 1;
+			break;
+		case SPEED_100 + DUPLEX_HALF:
 			np->speed = 100;
-			np->full_duplex = (cmd->duplex == DUPLEX_FULL);
+			np->full_duplex = 0;
 			break;
-		case SPEED_1000: /* not supported */
+		case SPEED_100 + DUPLEX_FULL:
+			np->speed = 100;
+			np->full_duplex = 1;
+			break;
+		case SPEED_1000 + DUPLEX_HALF:/* not supported */
+		case SPEED_1000 + DUPLEX_FULL:/* not supported */
 		default:
 			return -EINVAL;
 		}
@@ -1742,6 +1753,8 @@ rio_close (struct net_device *dev)
 
 	/* Free all the skbuffs in the queue. */
 	for (i = 0; i < RX_RING_SIZE; i++) {
+		np->rx_ring[i].status = 0;
+		np->rx_ring[i].fraginfo = 0;
 		skb = np->rx_skbuff[i];
 		if (skb) {
 			pci_unmap_single(np->pdev,
@@ -1750,8 +1763,6 @@ rio_close (struct net_device *dev)
 			dev_kfree_skb (skb);
 			np->rx_skbuff[i] = NULL;
 		}
-		np->rx_ring[i].status = 0;
-		np->rx_ring[i].fraginfo = 0;
 	}
 	for (i = 0; i < TX_RING_SIZE; i++) {
 		skb = np->tx_skbuff[i];

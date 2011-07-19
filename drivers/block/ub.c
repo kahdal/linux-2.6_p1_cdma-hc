@@ -28,7 +28,6 @@
 #include <linux/timer.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
-#include <linux/mutex.h>
 #include <scsi/scsi.h>
 
 #define DRV_NAME "ub"
@@ -248,7 +247,6 @@ struct ub_completion {
 	spinlock_t lock;
 };
 
-static DEFINE_MUTEX(ub_mutex);
 static inline void ub_init_completion(struct ub_completion *x)
 {
 	x->done = 0;
@@ -397,7 +395,7 @@ static int ub_probe_lun(struct ub_dev *sc, int lnum);
 #else
 
 static const struct usb_device_id ub_usb_ids[] = {
-	{ USB_INTERFACE_INFO(USB_CLASS_MASS_STORAGE, USB_SC_SCSI, USB_PR_BULK) },
+	{ USB_INTERFACE_INFO(USB_CLASS_MASS_STORAGE, US_SC_SCSI, US_PR_BULK) },
 	{ }
 };
 
@@ -650,7 +648,7 @@ static int ub_request_fn_1(struct ub_lun *lun, struct request *rq)
 		return 0;
 	}
 
-	if (lun->changed && rq->cmd_type != REQ_TYPE_BLOCK_PC) {
+	if (lun->changed && !blk_pc_request(rq)) {
 		blk_start_request(rq);
 		ub_end_rq(rq, SAM_STAT_CHECK_CONDITION);
 		return 0;
@@ -686,7 +684,7 @@ static int ub_request_fn_1(struct ub_lun *lun, struct request *rq)
 	}
 	urq->nsg = n_elem;
 
-	if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
+	if (blk_pc_request(rq)) {
 		ub_cmd_build_packet(sc, lun, cmd, urq);
 	} else {
 		ub_cmd_build_block(sc, lun, cmd, urq);
@@ -783,7 +781,7 @@ static void ub_rw_cmd_done(struct ub_dev *sc, struct ub_scsi_cmd *cmd)
 	rq = urq->rq;
 
 	if (cmd->error == 0) {
-		if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
+		if (blk_pc_request(rq)) {
 			if (cmd->act_len >= rq->resid_len)
 				rq->resid_len = 0;
 			else
@@ -797,7 +795,7 @@ static void ub_rw_cmd_done(struct ub_dev *sc, struct ub_scsi_cmd *cmd)
 			}
 		}
 	} else {
-		if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
+		if (blk_pc_request(rq)) {
 			/* UB_SENSE_SIZE is smaller than SCSI_SENSE_BUFFERSIZE */
 			memcpy(rq->sense, sc->top_sense, UB_SENSE_SIZE);
 			rq->sense_len = UB_SENSE_SIZE;
@@ -1712,18 +1710,6 @@ err_open:
 	return rc;
 }
 
-static int ub_bd_unlocked_open(struct block_device *bdev, fmode_t mode)
-{
-	int ret;
-
-	mutex_lock(&ub_mutex);
-	ret = ub_bd_open(bdev, mode);
-	mutex_unlock(&ub_mutex);
-
-	return ret;
-}
-
-
 /*
  */
 static int ub_bd_release(struct gendisk *disk, fmode_t mode)
@@ -1731,10 +1717,7 @@ static int ub_bd_release(struct gendisk *disk, fmode_t mode)
 	struct ub_lun *lun = disk->private_data;
 	struct ub_dev *sc = lun->udev;
 
-	mutex_lock(&ub_mutex);
 	ub_put(sc);
-	mutex_unlock(&ub_mutex);
-
 	return 0;
 }
 
@@ -1746,13 +1729,8 @@ static int ub_bd_ioctl(struct block_device *bdev, fmode_t mode,
 {
 	struct gendisk *disk = bdev->bd_disk;
 	void __user *usermem = (void __user *) arg;
-	int ret;
 
-	mutex_lock(&ub_mutex);
-	ret = scsi_cmd_ioctl(disk->queue, disk, mode, cmd, usermem);
-	mutex_unlock(&ub_mutex);
-
-	return ret;
+	return scsi_cmd_ioctl(disk->queue, disk, mode, cmd, usermem);
 }
 
 /*
@@ -1788,8 +1766,7 @@ static int ub_bd_revalidate(struct gendisk *disk)
  *
  * The return code is bool!
  */
-static unsigned int ub_bd_check_events(struct gendisk *disk,
-				       unsigned int clearing)
+static int ub_bd_media_changed(struct gendisk *disk)
 {
 	struct ub_lun *lun = disk->private_data;
 
@@ -1807,18 +1784,18 @@ static unsigned int ub_bd_check_events(struct gendisk *disk,
 	 */
 	if (ub_sync_tur(lun->udev, lun) != 0) {
 		lun->changed = 1;
-		return DISK_EVENT_MEDIA_CHANGE;
+		return 1;
 	}
 
-	return lun->changed ? DISK_EVENT_MEDIA_CHANGE : 0;
+	return lun->changed;
 }
 
 static const struct block_device_operations ub_bd_fops = {
 	.owner		= THIS_MODULE,
-	.open		= ub_bd_unlocked_open,
+	.open		= ub_bd_open,
 	.release	= ub_bd_release,
-	.ioctl		= ub_bd_ioctl,
-	.check_events	= ub_bd_check_events,
+	.locked_ioctl	= ub_bd_ioctl,
+	.media_changed	= ub_bd_media_changed,
 	.revalidate_disk = ub_bd_revalidate,
 };
 

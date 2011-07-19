@@ -24,7 +24,6 @@
 #include <linux/interrupt.h>
 #include <linux/errno.h>
 #include <linux/platform_device.h>
-#include <linux/sched.h>
 #include <linux/workqueue.h>
 #include <linux/delay.h>
 #include <linux/io.h>
@@ -33,7 +32,6 @@
 #include <linux/spi/spi.h>
 
 #include <asm/coldfire.h>
-#include <asm/mcfsim.h>
 #include <asm/mcfqspi.h>
 
 #define	DRIVER_NAME "mcfqspi"
@@ -318,7 +316,7 @@ static void mcfqspi_work(struct work_struct *work)
 		msg = container_of(mcfqspi->msgq.next, struct spi_message,
 				   queue);
 
-		list_del_init(&msg->queue);
+		list_del_init(&mcfqspi->msgq);
 		spin_unlock_irqrestore(&mcfqspi->lock, flags);
 
 		spi = msg->spi;

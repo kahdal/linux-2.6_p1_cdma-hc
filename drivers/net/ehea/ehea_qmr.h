@@ -29,7 +29,6 @@
 #ifndef __EHEA_QMR_H__
 #define __EHEA_QMR_H__
 
-#include <linux/prefetch.h>
 #include "ehea.h"
 #include "ehea_hw.h"
 
@@ -127,7 +126,7 @@ struct ehea_swqe {
 			u8 immediate_data[SWQE2_MAX_IMM];
 			/* 0xd0 */
 			struct ehea_vsgentry sg_list[EHEA_MAX_WQE_SG_ENTRIES-1];
-		} immdata_desc __packed;
+		} immdata_desc __attribute__ ((packed));
 
 		/*  Send WQE Format 3 */
 		struct {
@@ -151,7 +150,6 @@ struct ehea_rwqe {
 #define EHEA_CQE_TYPE_RQ           0x60
 #define EHEA_CQE_STAT_ERR_MASK     0x700F
 #define EHEA_CQE_STAT_FAT_ERR_MASK 0xF
-#define EHEA_CQE_BLIND_CKSUM       0x8000
 #define EHEA_CQE_STAT_ERR_TCP      0x4000
 #define EHEA_CQE_STAT_ERR_IP       0x2000
 #define EHEA_CQE_STAT_ERR_CRC      0x1000

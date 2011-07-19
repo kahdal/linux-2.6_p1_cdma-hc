@@ -10,7 +10,6 @@
 #include <linux/phy.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
-#include <linux/of_address.h>
 #include <linux/slab.h>
 #include <linux/of_mdio.h>
 

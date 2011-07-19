@@ -54,11 +54,6 @@ module_param(pq_sources, uint, S_IRUGO);
 MODULE_PARM_DESC(pq_sources,
 		"Number of p+q source buffers (default: 3)");
 
-static int timeout = 3000;
-module_param(timeout, uint, S_IRUGO);
-MODULE_PARM_DESC(timeout, "Transfer Timeout in msec (default: 3000), "
-		 "Pass -1 for infinite timeout");
-
 /*
  * Initialization patterns. All bytes in the source buffer has bit 7
  * set, all bytes in the destination buffer has bit 7 cleared.
@@ -290,12 +285,7 @@ static int dmatest_func(void *data)
 
 	set_user_nice(current, 10);
 
-	/*
-	 * src buffers are freed by the DMAEngine code with dma_unmap_single()
-	 * dst buffers are freed by ourselves below
-	 */
-	flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT
-	      | DMA_COMPL_SKIP_DEST_UNMAP | DMA_COMPL_SRC_UNMAP_SINGLE;
+	flags = DMA_CTRL_ACK | DMA_COMPL_SKIP_DEST_UNMAP | DMA_PREP_INTERRUPT;
 
 	while (!kthread_should_stop()
 	       && !(iterations && total_tests >= iterations)) {
@@ -304,7 +294,7 @@ static int dmatest_func(void *data)
 		dma_addr_t dma_srcs[src_cnt];
 		dma_addr_t dma_dsts[dst_cnt];
 		struct completion cmp;
-		unsigned long tmo = msecs_to_jiffies(timeout);
+		unsigned long tmo = msecs_to_jiffies(3000);
 		u8 align = 0;
 
 		total_tests++;
@@ -550,7 +540,7 @@ static int dmatest_add_channel(struct dma_chan *chan)
 	struct dmatest_chan	*dtc;
 	struct dma_device	*dma_dev = chan->device;
 	unsigned int		thread_count = 0;
-	int cnt;
+	unsigned int		cnt;
 
 	dtc = kmalloc(sizeof(struct dmatest_chan), GFP_KERNEL);
 	if (!dtc) {
@@ -634,5 +624,5 @@ static void __exit dmatest_exit(void)
 }
 module_exit(dmatest_exit);
 
-MODULE_AUTHOR("Haavard Skinnemoen (Atmel)");
+MODULE_AUTHOR("Haavard Skinnemoen <hskinnemoen@atmel.com>");
 MODULE_LICENSE("GPL v2");

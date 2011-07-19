@@ -19,7 +19,6 @@
 #include <linux/errno.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
-#include <linux/sysfs.h>
 #include <linux/xattr.h>
 #include <linux/security.h>
 #include "sysfs.h"
@@ -123,7 +122,7 @@ int sysfs_setattr(struct dentry *dentry, struct iattr *iattr)
 		goto out;
 
 	/* this ignores size changes */
-	setattr_copy(inode, iattr);
+	generic_setattr(inode, iattr);
 
 out:
 	mutex_unlock(&sysfs_mutex);
@@ -313,15 +312,15 @@ struct inode * sysfs_get_inode(struct super_block *sb, struct sysfs_dirent *sd)
  * The sysfs_dirent serves as both an inode and a directory entry for sysfs.
  * To prevent the sysfs inode numbers from being freed prematurely we take a
  * reference to sysfs_dirent from the sysfs inode.  A
- * super_operations.evict_inode() implementation is needed to drop that
+ * super_operations.delete_inode() implementation is needed to drop that
  * reference upon inode destruction.
  */
-void sysfs_evict_inode(struct inode *inode)
+void sysfs_delete_inode(struct inode *inode)
 {
 	struct sysfs_dirent *sd  = inode->i_private;
 
 	truncate_inode_pages(&inode->i_data, 0);
-	end_writeback(inode);
+	clear_inode(inode);
 	sysfs_put(sd);
 }
 
@@ -349,18 +348,13 @@ int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const void *ns, const cha
 		return -ENOENT;
 }
 
-int sysfs_permission(struct inode *inode, int mask, unsigned int flags)
+int sysfs_permission(struct inode *inode, int mask)
 {
-	struct sysfs_dirent *sd;
-
-	if (flags & IPERM_FLAG_RCU)
-		return -ECHILD;
-
-	sd = inode->i_private;
+	struct sysfs_dirent *sd = inode->i_private;
 
 	mutex_lock(&sysfs_mutex);
 	sysfs_refresh_inode(sd, inode);
 	mutex_unlock(&sysfs_mutex);
 
-	return generic_permission(inode, mask, flags, NULL);
+	return generic_permission(inode, mask, NULL);
 }

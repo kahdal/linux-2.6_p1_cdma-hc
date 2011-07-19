@@ -251,20 +251,20 @@ struct log_c {
  */
 static inline int log_test_bit(uint32_t *bs, unsigned bit)
 {
-	return test_bit_le(bit, (unsigned long *) bs) ? 1 : 0;
+	return ext2_test_bit(bit, (unsigned long *) bs) ? 1 : 0;
 }
 
 static inline void log_set_bit(struct log_c *l,
 			       uint32_t *bs, unsigned bit)
 {
-	__test_and_set_bit_le(bit, (unsigned long *) bs);
+	ext2_set_bit(bit, (unsigned long *) bs);
 	l->touched_cleaned = 1;
 }
 
 static inline void log_clear_bit(struct log_c *l,
 				 uint32_t *bs, unsigned bit)
 {
-	__test_and_clear_bit_le(bit, (unsigned long *) bs);
+	ext2_clear_bit(bit, (unsigned long *) bs);
 	l->touched_dirtied = 1;
 }
 
@@ -300,7 +300,7 @@ static int flush_header(struct log_c *lc)
 		.count = 0,
 	};
 
-	lc->io_req.bi_rw = WRITE_FLUSH;
+	lc->io_req.bi_rw = WRITE_BARRIER;
 
 	return dm_io(&lc->io_req, 1, &null_location, NULL);
 }
@@ -449,12 +449,13 @@ static int create_log_context(struct dm_dirty_log *log, struct dm_target *ti,
 
 		lc->io_req.mem.type = DM_IO_VMA;
 		lc->io_req.notify.fn = NULL;
-		lc->io_req.client = dm_io_client_create();
+		lc->io_req.client = dm_io_client_create(dm_div_up(buf_size,
+								   PAGE_SIZE));
 		if (IS_ERR(lc->io_req.client)) {
 			r = PTR_ERR(lc->io_req.client);
 			DMWARN("couldn't allocate disk io client");
 			kfree(lc);
-			return r;
+			return -ENOMEM;
 		}
 
 		lc->disk_header = vmalloc(buf_size);
@@ -542,7 +543,7 @@ static int disk_ctr(struct dm_dirty_log *log, struct dm_target *ti,
 		return -EINVAL;
 	}
 
-	r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dev);
+	r = dm_get_device(ti, argv[0], FMODE_READ | FMODE_WRITE, &dev);
 	if (r)
 		return r;
 
@@ -739,7 +740,7 @@ static int core_get_resync_work(struct dm_dirty_log *log, region_t *region)
 		return 0;
 
 	do {
-		*region = find_next_zero_bit_le(
+		*region = ext2_find_next_zero_bit(
 					     (unsigned long *) lc->sync_bits,
 					     lc->region_count,
 					     lc->sync_search);

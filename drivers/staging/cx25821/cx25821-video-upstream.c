@@ -20,8 +20,6 @@
  *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
 #include "cx25821-video.h"
 #include "cx25821-video-upstream.h"
 
@@ -41,7 +39,7 @@ MODULE_AUTHOR("Hiep Huynh <hiep.huynh@conexant.com>");
 MODULE_LICENSE("GPL");
 
 static int _intr_msk =
-	FLD_VID_SRC_RISC1 | FLD_VID_SRC_UF | FLD_VID_SRC_SYNC | FLD_VID_SRC_OPC_ERR;
+    FLD_VID_SRC_RISC1 | FLD_VID_SRC_UF | FLD_VID_SRC_SYNC | FLD_VID_SRC_OPC_ERR;
 
 int cx25821_sram_channel_setup_upstream(struct cx25821_dev *dev,
 					struct sram_channel *ch,
@@ -136,7 +134,7 @@ static __le32 *cx25821_risc_field_upstream(struct cx25821_dev *dev, __le32 * rp,
 {
 	unsigned int line, i;
 	struct sram_channel *sram_ch =
-	   dev->channels[dev->_channel_upstream_select].sram_channels;
+	    &dev->sram_channels[dev->_channel_upstream_select];
 	int dist_betwn_starts = bpl * 2;
 
 	/* sync instruction */
@@ -255,11 +253,12 @@ int cx25821_risc_buffer_upstream(struct cx25821_dev *dev,
 void cx25821_stop_upstream_video_ch1(struct cx25821_dev *dev)
 {
 	struct sram_channel *sram_ch =
-	   dev->channels[VID_UPSTREAM_SRAM_CHANNEL_I].sram_channels;
+	    &dev->sram_channels[VID_UPSTREAM_SRAM_CHANNEL_I];
 	u32 tmp = 0;
 
 	if (!dev->_is_running) {
-		pr_info("No video file is currently running so return!\n");
+		printk
+		   (KERN_INFO "cx25821: No video file is currently running so return!\n");
 		return;
 	}
 	/* Disable RISC interrupts */
@@ -279,10 +278,13 @@ void cx25821_stop_upstream_video_ch1(struct cx25821_dev *dev)
 	dev->_frame_count = 0;
 	dev->_file_status = END_OF_FILE;
 
-	kfree(dev->_irq_queues);
-	dev->_irq_queues = NULL;
+	if (dev->_irq_queues) {
+		kfree(dev->_irq_queues);
+		dev->_irq_queues = NULL;
+	}
 
-	kfree(dev->_filename);
+	if (dev->_filename != NULL)
+		kfree(dev->_filename);
 
 	tmp = cx_read(VID_CH_MODE_SEL);
 	cx_write(VID_CH_MODE_SEL, tmp & 0xFFFFFE00);
@@ -344,19 +346,19 @@ int cx25821_get_frame(struct cx25821_dev *dev, struct sram_channel *sram_ch)
 
 	if (IS_ERR(myfile)) {
 		const int open_errno = -PTR_ERR(myfile);
-		pr_err("%s(): ERROR opening file(%s) with errno = %d!\n",
+		printk(KERN_ERR "%s(): ERROR opening file(%s) with errno = %d!\n",
 		       __func__, dev->_filename, open_errno);
 		return PTR_ERR(myfile);
 	} else {
 		if (!(myfile->f_op)) {
-			pr_err("%s(): File has no file operations registered!\n",
+			printk(KERN_ERR "%s: File has no file operations registered!",
 			       __func__);
 			filp_close(myfile, NULL);
 			return -EIO;
 		}
 
 		if (!myfile->f_op->read) {
-			pr_err("%s(): File has no READ operations registered!\n",
+			printk(KERN_ERR "%s: File has no READ operations registered!",
 			       __func__);
 			filp_close(myfile, NULL);
 			return -EIO;
@@ -383,8 +385,9 @@ int cx25821_get_frame(struct cx25821_dev *dev, struct sram_channel *sram_ch)
 			frame_offset += vfs_read_retval;
 
 			if (vfs_read_retval < line_size) {
-				pr_info("Done: exit %s() since no more bytes to read from Video file\n",
-					__func__);
+				printk(KERN_INFO
+				       "Done: exit %s() since no more bytes to read from Video file.\n",
+				       __func__);
 				break;
 			}
 		}
@@ -408,14 +411,13 @@ static void cx25821_vidups_handler(struct work_struct *work)
 	    container_of(work, struct cx25821_dev, _irq_work_entry);
 
 	if (!dev) {
-		pr_err("ERROR %s(): since container_of(work_struct) FAILED!\n",
+		printk(KERN_ERR "ERROR %s(): since container_of(work_struct) FAILED!\n",
 		       __func__);
 		return;
 	}
 
 	cx25821_get_frame(dev,
-			 dev->channels[dev->_channel_upstream_select].
-					       sram_channels);
+			  &dev->sram_channels[dev->_channel_upstream_select]);
 }
 
 int cx25821_openfile(struct cx25821_dev *dev, struct sram_channel *sram_ch)
@@ -435,20 +437,21 @@ int cx25821_openfile(struct cx25821_dev *dev, struct sram_channel *sram_ch)
 
 	if (IS_ERR(myfile)) {
 		const int open_errno = -PTR_ERR(myfile);
-		pr_err("%s(): ERROR opening file(%s) with errno = %d!\n",
+		printk(KERN_ERR "%s(): ERROR opening file(%s) with errno = %d!\n",
 		       __func__, dev->_filename, open_errno);
 		return PTR_ERR(myfile);
 	} else {
 		if (!(myfile->f_op)) {
-			pr_err("%s(): File has no file operations registered!\n",
+			printk(KERN_ERR "%s: File has no file operations registered!",
 			       __func__);
 			filp_close(myfile, NULL);
 			return -EIO;
 		}
 
 		if (!myfile->f_op->read) {
-			pr_err("%s(): File has no READ operations registered!  Returning\n",
-			       __func__);
+			printk
+			    (KERN_ERR "%s: File has no READ operations registered!  Returning.",
+			     __func__);
 			filp_close(myfile, NULL);
 			return -EIO;
 		}
@@ -476,8 +479,9 @@ int cx25821_openfile(struct cx25821_dev *dev, struct sram_channel *sram_ch)
 				offset += vfs_read_retval;
 
 				if (vfs_read_retval < line_size) {
-					pr_info("Done: exit %s() since no more bytes to read from Video file\n",
-						__func__);
+					printk(KERN_INFO
+					       "Done: exit %s() since no more bytes to read from Video file.\n",
+					       __func__);
 					break;
 				}
 			}
@@ -521,7 +525,8 @@ int cx25821_upstream_buffer_prepare(struct cx25821_dev *dev,
 	dev->_risc_size = dev->upstream_riscbuf_size;
 
 	if (!dev->_dma_virt_addr) {
-		pr_err("FAILED to allocate memory for Risc buffer! Returning\n");
+		printk
+		    (KERN_ERR "cx25821: FAILED to allocate memory for Risc buffer! Returning.\n");
 		return -ENOMEM;
 	}
 
@@ -541,7 +546,8 @@ int cx25821_upstream_buffer_prepare(struct cx25821_dev *dev,
 	dev->_data_buf_size = dev->upstream_databuf_size;
 
 	if (!dev->_data_buf_virt_addr) {
-		pr_err("FAILED to allocate memory for data buffer! Returning\n");
+		printk
+		    (KERN_ERR "cx25821: FAILED to allocate memory for data buffer! Returning.\n");
 		return -ENOMEM;
 	}
 
@@ -557,7 +563,8 @@ int cx25821_upstream_buffer_prepare(struct cx25821_dev *dev,
 	    cx25821_risc_buffer_upstream(dev, dev->pci, 0, bpl,
 					 dev->_lines_count);
 	if (ret < 0) {
-		pr_info("Failed creating Video Upstream Risc programs!\n");
+		printk(KERN_INFO
+		    "cx25821: Failed creating Video Upstream Risc programs!\n");
 		goto error;
 	}
 
@@ -571,7 +578,7 @@ int cx25821_video_upstream_irq(struct cx25821_dev *dev, int chan_num,
 			       u32 status)
 {
 	u32 int_msk_tmp;
-	struct sram_channel *channel = dev->channels[chan_num].sram_channels;
+	struct sram_channel *channel = &dev->sram_channels[chan_num];
 	int singlefield_lines = NTSC_FIELD_HEIGHT;
 	int line_size_in_bytes = Y422_LINE_SZ;
 	int odd_risc_prog_size = 0;
@@ -634,20 +641,22 @@ int cx25821_video_upstream_irq(struct cx25821_dev *dev, int chan_num,
 		spin_unlock(&dev->slock);
 	} else {
 		if (status & FLD_VID_SRC_UF)
-			pr_err("%s(): Video Received Underflow Error Interrupt!\n",
-			       __func__);
+			printk
+			    (KERN_ERR "%s: Video Received Underflow Error Interrupt!\n",
+			     __func__);
 
 		if (status & FLD_VID_SRC_SYNC)
-			pr_err("%s(): Video Received Sync Error Interrupt!\n",
+			printk(KERN_ERR "%s: Video Received Sync Error Interrupt!\n",
 			       __func__);
 
 		if (status & FLD_VID_SRC_OPC_ERR)
-			pr_err("%s(): Video Received OpCode Error Interrupt!\n",
+			printk(KERN_ERR "%s: Video Received OpCode Error Interrupt!\n",
 			       __func__);
 	}
 
 	if (dev->_file_status == END_OF_FILE) {
-		pr_err("EOF Channel 1 Framecount = %d\n", dev->_frame_count);
+		printk(KERN_ERR "cx25821: EOF Channel 1 Framecount = %d\n",
+		       dev->_frame_count);
 		return -1;
 	}
 	/* ElSE, set the interrupt mask register, re-enable irq. */
@@ -670,7 +679,7 @@ static irqreturn_t cx25821_upstream_irq(int irq, void *dev_id)
 
 	channel_num = VID_UPSTREAM_SRAM_CHANNEL_I;
 
-	sram_ch = dev->channels[channel_num].sram_channels;
+	sram_ch = &dev->sram_channels[channel_num];
 
 	msk_stat = cx_read(sram_ch->int_mstat);
 	vid_status = cx_read(sram_ch->int_stat);
@@ -755,8 +764,8 @@ int cx25821_start_video_dma_upstream(struct cx25821_dev *dev,
 	    request_irq(dev->pci->irq, cx25821_upstream_irq,
 			IRQF_SHARED | IRQF_DISABLED, dev->name, dev);
 	if (err < 0) {
-		pr_err("%s: can't get upstream IRQ %d\n",
-		       dev->name, dev->pci->irq);
+		printk(KERN_ERR "%s: can't get upstream IRQ %d\n", dev->name,
+		       dev->pci->irq);
 		goto fail_irq;
 	}
 
@@ -786,18 +795,19 @@ int cx25821_vidupstream_init_ch1(struct cx25821_dev *dev, int channel_select,
 	int str_length = 0;
 
 	if (dev->_is_running) {
-		pr_info("Video Channel is still running so return!\n");
+		printk(KERN_INFO "Video Channel is still running so return!\n");
 		return 0;
 	}
 
 	dev->_channel_upstream_select = channel_select;
-	sram_ch = dev->channels[channel_select].sram_channels;
+	sram_ch = &dev->sram_channels[channel_select];
 
 	INIT_WORK(&dev->_irq_work_entry, cx25821_vidups_handler);
 	dev->_irq_queues = create_singlethread_workqueue("cx25821_workqueue");
 
 	if (!dev->_irq_queues) {
-		pr_err("create_singlethread_workqueue() for Video FAILED!\n");
+		printk
+		    (KERN_ERR "cx25821: create_singlethread_workqueue() for Video FAILED!\n");
 		return -ENOMEM;
 	}
 	/* 656/VIP SRC Upstream Channel I & J and 7 - Host Bus Interface for
@@ -873,7 +883,8 @@ int cx25821_vidupstream_init_ch1(struct cx25821_dev *dev, int channel_select,
 	/* Allocating buffers and prepare RISC program */
 	retval = cx25821_upstream_buffer_prepare(dev, sram_ch, dev->_line_size);
 	if (retval < 0) {
-		pr_err("%s: Failed to set up Video upstream buffers!\n",
+		printk(KERN_ERR
+		       "%s: Failed to set up Video upstream buffers!\n",
 		       dev->name);
 		goto error;
 	}

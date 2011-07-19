@@ -29,6 +29,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 
+#include <pcmcia/cs_types.h>
 #include <pcmcia/ss.h>
 
 #include <asm/mach-au1x00/au1000.h>
@@ -181,7 +182,7 @@ static int db1x_pcmcia_setup_irqs(struct db1x_pcmcia_sock *sock)
 		/* all other (older) Db1x00 boards use a GPIO to show
 		 * card detection status:  use both-edge triggers.
 		 */
-		irq_set_irq_type(sock->insert_irq, IRQ_TYPE_EDGE_BOTH);
+		set_irq_type(sock->insert_irq, IRQ_TYPE_EDGE_BOTH);
 		ret = request_irq(sock->insert_irq, db1000_pcmcia_cdirq,
 				  0, "pcmcia_carddetect", sock);
 

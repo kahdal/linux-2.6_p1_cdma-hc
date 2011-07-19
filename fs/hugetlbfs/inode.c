@@ -31,7 +31,6 @@
 #include <linux/statfs.h>
 #include <linux/security.h>
 #include <linux/magic.h>
-#include <linux/migrate.h>
 
 #include <asm/uaccess.h>
 
@@ -332,7 +331,8 @@ static void truncate_huge_page(struct page *page)
 {
 	cancel_dirty_page(page, /* No IO accounting for huge pages? */0);
 	ClearPageUptodate(page);
-	delete_from_page_cache(page);
+	remove_from_page_cache(page);
+	put_page(page);
 }
 
 static void truncate_hugepages(struct inode *inode, loff_t lstart)
@@ -371,10 +371,27 @@ static void truncate_hugepages(struct inode *inode, loff_t lstart)
 	hugetlb_unreserve_pages(inode, start, freed);
 }
 
-static void hugetlbfs_evict_inode(struct inode *inode)
+static void hugetlbfs_delete_inode(struct inode *inode)
 {
 	truncate_hugepages(inode, 0);
-	end_writeback(inode);
+	clear_inode(inode);
+}
+
+static void hugetlbfs_forget_inode(struct inode *inode) __releases(inode_lock)
+{
+	if (generic_detach_inode(inode)) {
+		truncate_hugepages(inode, 0);
+		clear_inode(inode);
+		destroy_inode(inode);
+	}
+}
+
+static void hugetlbfs_drop_inode(struct inode *inode)
+{
+	if (!inode->i_nlink)
+		generic_delete_inode(inode);
+	else
+		hugetlbfs_forget_inode(inode);
 }
 
 static inline void
@@ -412,10 +429,10 @@ static int hugetlb_vmtruncate(struct inode *inode, loff_t offset)
 	pgoff = offset >> PAGE_SHIFT;
 
 	i_size_write(inode, offset);
-	mutex_lock(&mapping->i_mmap_mutex);
+	spin_lock(&mapping->i_mmap_lock);
 	if (!prio_tree_empty(&mapping->i_mmap))
 		hugetlb_vmtruncate_list(&mapping->i_mmap, pgoff);
-	mutex_unlock(&mapping->i_mmap_mutex);
+	spin_unlock(&mapping->i_mmap_lock);
 	truncate_hugepages(inode, offset);
 	return 0;
 }
@@ -431,20 +448,19 @@ static int hugetlbfs_setattr(struct dentry *dentry, struct iattr *attr)
 
 	error = inode_change_ok(inode, attr);
 	if (error)
-		return error;
+		goto out;
 
 	if (ia_valid & ATTR_SIZE) {
 		error = -EINVAL;
-		if (attr->ia_size & ~huge_page_mask(h))
-			return -EINVAL;
-		error = hugetlb_vmtruncate(inode, attr->ia_size);
+		if (!(attr->ia_size & ~huge_page_mask(h)))
+			error = hugetlb_vmtruncate(inode, attr->ia_size);
 		if (error)
-			return error;
+			goto out;
+		attr->ia_valid &= ~ATTR_SIZE;
 	}
-
-	setattr_copy(inode, attr);
-	mark_inode_dirty(inode);
-	return 0;
+	error = inode_setattr(inode, attr);
+out:
+	return error;
 }
 
 static struct inode *hugetlbfs_get_inode(struct super_block *sb, uid_t uid, 
@@ -455,7 +471,6 @@ static struct inode *hugetlbfs_get_inode(struct super_block *sb, uid_t uid,
 	inode = new_inode(sb);
 	if (inode) {
 		struct hugetlbfs_inode_info *info;
-		inode->i_ino = get_next_ino();
 		inode->i_mode = mode;
 		inode->i_uid = uid;
 		inode->i_gid = gid;
@@ -574,19 +589,6 @@ static int hugetlbfs_set_page_dirty(struct page *page)
 	return 0;
 }
 
-static int hugetlbfs_migrate_page(struct address_space *mapping,
-				struct page *newpage, struct page *page)
-{
-	int rc;
-
-	rc = migrate_huge_page_move_mapping(mapping, newpage, page);
-	if (rc)
-		return rc;
-	migrate_page_copy(newpage, page);
-
-	return 0;
-}
-
 static int hugetlbfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct hugetlbfs_sb_info *sbinfo = HUGETLBFS_SB(dentry->d_sb);
@@ -662,25 +664,17 @@ static struct inode *hugetlbfs_alloc_inode(struct super_block *sb)
 	return &p->vfs_inode;
 }
 
-static void hugetlbfs_i_callback(struct rcu_head *head)
-{
-	struct inode *inode = container_of(head, struct inode, i_rcu);
-	INIT_LIST_HEAD(&inode->i_dentry);
-	kmem_cache_free(hugetlbfs_inode_cachep, HUGETLBFS_I(inode));
-}
-
 static void hugetlbfs_destroy_inode(struct inode *inode)
 {
 	hugetlbfs_inc_free_inodes(HUGETLBFS_SB(inode->i_sb));
 	mpol_free_shared_policy(&HUGETLBFS_I(inode)->policy);
-	call_rcu(&inode->i_rcu, hugetlbfs_i_callback);
+	kmem_cache_free(hugetlbfs_inode_cachep, HUGETLBFS_I(inode));
 }
 
 static const struct address_space_operations hugetlbfs_aops = {
 	.write_begin	= hugetlbfs_write_begin,
 	.write_end	= hugetlbfs_write_end,
 	.set_page_dirty	= hugetlbfs_set_page_dirty,
-	.migratepage    = hugetlbfs_migrate_page,
 };
 
 
@@ -696,7 +690,6 @@ const struct file_operations hugetlbfs_file_operations = {
 	.mmap			= hugetlbfs_file_mmap,
 	.fsync			= noop_fsync,
 	.get_unmapped_area	= hugetlb_get_unmapped_area,
-	.llseek		= default_llseek,
 };
 
 static const struct inode_operations hugetlbfs_dir_inode_operations = {
@@ -719,8 +712,9 @@ static const struct inode_operations hugetlbfs_inode_operations = {
 static const struct super_operations hugetlbfs_ops = {
 	.alloc_inode    = hugetlbfs_alloc_inode,
 	.destroy_inode  = hugetlbfs_destroy_inode,
-	.evict_inode	= hugetlbfs_evict_inode,
 	.statfs		= hugetlbfs_statfs,
+	.delete_inode	= hugetlbfs_delete_inode,
+	.drop_inode	= hugetlbfs_drop_inode,
 	.put_super	= hugetlbfs_put_super,
 	.show_options	= generic_show_options,
 };
@@ -902,15 +896,15 @@ void hugetlb_put_quota(struct address_space *mapping, long delta)
 	}
 }
 
-static struct dentry *hugetlbfs_mount(struct file_system_type *fs_type,
-	int flags, const char *dev_name, void *data)
+static int hugetlbfs_get_sb(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data, struct vfsmount *mnt)
 {
-	return mount_nodev(fs_type, flags, data, hugetlbfs_fill_super);
+	return get_sb_nodev(fs_type, flags, data, hugetlbfs_fill_super, mnt);
 }
 
 static struct file_system_type hugetlbfs_fs_type = {
 	.name		= "hugetlbfs",
-	.mount		= hugetlbfs_mount,
+	.get_sb		= hugetlbfs_get_sb,
 	.kill_sb	= kill_litter_super,
 };
 
@@ -921,8 +915,7 @@ static int can_do_hugetlb_shm(void)
 	return capable(CAP_IPC_LOCK) || in_group_p(sysctl_hugetlb_shm_group);
 }
 
-struct file *hugetlb_file_setup(const char *name, size_t size,
-				vm_flags_t acctflag,
+struct file *hugetlb_file_setup(const char *name, size_t size, int acctflag,
 				struct user_struct **user, int creat_flags)
 {
 	int error = -ENOMEM;
@@ -939,7 +932,8 @@ struct file *hugetlb_file_setup(const char *name, size_t size,
 	if (creat_flags == HUGETLB_SHMFS_INODE && !can_do_hugetlb_shm()) {
 		*user = current_user();
 		if (user_shm_lock(size, *user)) {
-			printk_once(KERN_WARNING "Using mlock ulimits for SHM_HUGETLB is deprecated\n");
+			WARN_ONCE(1,
+			  "Using mlock ulimits for SHM_HUGETLB deprecated\n");
 		} else {
 			*user = NULL;
 			return ERR_PTR(-EPERM);

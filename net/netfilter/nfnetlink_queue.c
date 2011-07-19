@@ -46,19 +46,17 @@ struct nfqnl_instance {
 	int peer_pid;
 	unsigned int queue_maxlen;
 	unsigned int copy_range;
+	unsigned int queue_total;
 	unsigned int queue_dropped;
 	unsigned int queue_user_dropped;
 
+	unsigned int id_sequence;		/* 'sequence' of pkt ids */
 
 	u_int16_t queue_num;			/* number of this queue */
 	u_int8_t copy_mode;
-/*
- * Following fields are dirtied for each queued packet,
- * keep them in same cache line if possible.
- */
-	spinlock_t	lock;
-	unsigned int	queue_total;
-	atomic_t	id_sequence;		/* 'sequence' of pkt ids */
+
+	spinlock_t lock;
+
 	struct list_head queue_list;		/* packets in queue */
 };
 
@@ -240,24 +238,32 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 
 	outdev = entry->outdev;
 
-	switch ((enum nfqnl_config_mode)ACCESS_ONCE(queue->copy_mode)) {
+	spin_lock_bh(&queue->lock);
+
+	switch ((enum nfqnl_config_mode)queue->copy_mode) {
 	case NFQNL_COPY_META:
 	case NFQNL_COPY_NONE:
 		break;
 
 	case NFQNL_COPY_PACKET:
 		if (entskb->ip_summed == CHECKSUM_PARTIAL &&
-		    skb_checksum_help(entskb))
+		    skb_checksum_help(entskb)) {
+			spin_unlock_bh(&queue->lock);
 			return NULL;
-
-		data_len = ACCESS_ONCE(queue->copy_range);
-		if (data_len == 0 || data_len > entskb->len)
+		}
+		if (queue->copy_range == 0
+		    || queue->copy_range > entskb->len)
 			data_len = entskb->len;
+		else
+			data_len = queue->copy_range;
 
 		size += nla_total_size(data_len);
 		break;
 	}
 
+	entry->id = queue->id_sequence++;
+
+	spin_unlock_bh(&queue->lock);
 
 	skb = alloc_skb(size, GFP_ATOMIC);
 	if (!skb)
@@ -272,7 +278,6 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 	nfmsg->version = NFNETLINK_V0;
 	nfmsg->res_id = htons(queue->queue_num);
 
-	entry->id = atomic_inc_return(&queue->id_sequence);
 	pmsg.packet_id 		= htonl(entry->id);
 	pmsg.hw_protocol	= entskb->protocol;
 	pmsg.hook		= entry->hook;
@@ -291,9 +296,8 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 			NLA_PUT_BE32(skb, NFQA_IFINDEX_PHYSINDEV,
 				     htonl(indev->ifindex));
 			/* this is the bridge group "brX" */
-			/* rcu_read_lock()ed by __nf_queue */
 			NLA_PUT_BE32(skb, NFQA_IFINDEX_INDEV,
-				     htonl(br_port_get_rcu(indev)->br->dev->ifindex));
+				     htonl(indev->br_port->br->dev->ifindex));
 		} else {
 			/* Case 2: indev is bridge group, we need to look for
 			 * physical device (when called from ipv4) */
@@ -317,9 +321,8 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 			NLA_PUT_BE32(skb, NFQA_IFINDEX_PHYSOUTDEV,
 				     htonl(outdev->ifindex));
 			/* this is the bridge group "brX" */
-			/* rcu_read_lock()ed by __nf_queue */
 			NLA_PUT_BE32(skb, NFQA_IFINDEX_OUTDEV,
-				     htonl(br_port_get_rcu(outdev)->br->dev->ifindex));
+				     htonl(outdev->br_port->br->dev->ifindex));
 		} else {
 			/* Case 2: outdev is bridge group, we need to look for
 			 * physical output device (when called from ipv4) */
@@ -335,8 +338,7 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 	if (entskb->mark)
 		NLA_PUT_BE32(skb, NFQA_MARK, htonl(entskb->mark));
 
-	if (indev && entskb->dev &&
-	    entskb->mac_header != entskb->network_header) {
+	if (indev && entskb->dev) {
 		struct nfqnl_msg_packet_hw phw;
 		int len = dev_parse_header(entskb, phw.hw_addr);
 		if (len) {
@@ -388,31 +390,25 @@ nfqnl_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
 {
 	struct sk_buff *nskb;
 	struct nfqnl_instance *queue;
-	int err = -ENOBUFS;
+	int err;
 
 	/* rcu_read_lock()ed by nf_hook_slow() */
 	queue = instance_lookup(queuenum);
-	if (!queue) {
-		err = -ESRCH;
+	if (!queue)
 		goto err_out;
-	}
 
-	if (queue->copy_mode == NFQNL_COPY_NONE) {
-		err = -EINVAL;
+	if (queue->copy_mode == NFQNL_COPY_NONE)
 		goto err_out;
-	}
 
 	nskb = nfqnl_build_packet_message(queue, entry);
-	if (nskb == NULL) {
-		err = -ENOMEM;
+	if (nskb == NULL)
 		goto err_out;
-	}
+
 	spin_lock_bh(&queue->lock);
 
-	if (!queue->peer_pid) {
-		err = -EINVAL;
+	if (!queue->peer_pid)
 		goto err_out_free_nskb;
-	}
+
 	if (queue->queue_total >= queue->queue_maxlen) {
 		queue->queue_dropped++;
 		if (net_ratelimit())
@@ -439,7 +435,7 @@ err_out_free_nskb:
 err_out_unlock:
 	spin_unlock_bh(&queue->lock);
 err_out:
-	return err;
+	return -1;
 }
 
 static int
@@ -870,7 +866,7 @@ static int seq_show(struct seq_file *s, void *v)
 			  inst->peer_pid, inst->queue_total,
 			  inst->copy_mode, inst->copy_range,
 			  inst->queue_dropped, inst->queue_user_dropped,
-			  atomic_read(&inst->id_sequence), 1);
+			  inst->id_sequence, 1);
 }
 
 static const struct seq_operations nfqnl_seq_ops = {

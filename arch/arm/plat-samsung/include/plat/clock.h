@@ -21,7 +21,7 @@ struct clk;
  * @set_parent: set the clock's parent, see clk_set_parent().
  *
  * Group the common clock implementations together so that we
- * don't have to keep setting the same fields again. We leave
+ * don't have to keep setting the same fiels again. We leave
  * enable in struct clk.
  *
  * Adding an extra layer of indirection into the process should
@@ -46,10 +46,8 @@ struct clk {
 	unsigned long         ctrlbit;
 
 	struct clk_ops		*ops;
+	struct device		*dev;
 	int		    (*enable)(struct clk *, int enable);
-#if defined(CONFIG_PM_DEBUG) && defined(CONFIG_DEBUG_FS)
-	struct dentry		*dent;	/* For visible tree hierarchy */
-#endif
 };
 
 /* other clocks which may be registered by board support */

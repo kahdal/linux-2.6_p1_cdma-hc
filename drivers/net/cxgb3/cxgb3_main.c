@@ -644,6 +644,26 @@ static void enable_all_napi(struct adapter *adap)
 }
 
 /**
+ *	set_qset_lro - Turn a queue set's LRO capability on and off
+ *	@dev: the device the qset is attached to
+ *	@qset_idx: the queue set index
+ *	@val: the LRO switch
+ *
+ *	Sets LRO on or off for a particular queue set.
+ *	the device's features flag is updated to reflect the LRO
+ *	capability when all queues belonging to the device are
+ *	in the same state.
+ */
+static void set_qset_lro(struct net_device *dev, int qset_idx, int val)
+{
+	struct port_info *pi = netdev_priv(dev);
+	struct adapter *adapter = pi->adapter;
+
+	adapter->params.sge.qset[qset_idx].lro = !!val;
+	adapter->sge.qs[qset_idx].lro_enabled = !!val;
+}
+
+/**
  *	setup_sge_qsets - configure SGE Tx/Rx/response queues
  *	@adap: the adapter
  *
@@ -665,6 +685,7 @@ static int setup_sge_qsets(struct adapter *adap)
 
 		pi->qs = &adap->sge.qs[pi->first_qset];
 		for (j = 0; j < pi->nqsets; ++j, ++qset_idx) {
+			set_qset_lro(dev, qset_idx, pi->rx_offload & T3_LRO);
 			err = t3_sge_alloc_qset(adap, qset_idx, 1,
 				(adap->flags & USING_MSIX) ? qset_idx + 1 :
 							     irq_idx,
@@ -1245,13 +1266,11 @@ static int cxgb_up(struct adapter *adap)
 	}
 
 	if (!(adap->flags & QUEUES_BOUND)) {
-		int ret = bind_qsets(adap);
-
-		if (ret < 0) {
-			CH_ERR(adap, "failed to bind qsets, err %d\n", ret);
+		err = bind_qsets(adap);
+		if (err) {
+			CH_ERR(adap, "failed to bind qsets, err %d\n", err);
 			t3_intr_disable(adap);
 			free_irq_resources(adap);
-			err = ret;
 			goto out;
 		}
 		adap->flags |= QUEUES_BOUND;
@@ -1267,7 +1286,7 @@ irq_err:
 /*
  * Release resources when all the ports and offloading have been stopped.
  */
-static void cxgb_down(struct adapter *adapter, int on_wq)
+static void cxgb_down(struct adapter *adapter)
 {
 	t3_sge_stop(adapter);
 	spin_lock_irq(&adapter->work_lock);	/* sync with PHY intr task */
@@ -1277,8 +1296,7 @@ static void cxgb_down(struct adapter *adapter, int on_wq)
 	free_irq_resources(adapter);
 	quiesce_rx(adapter);
 	t3_sge_stop(adapter);
-	if (!on_wq)
-		flush_workqueue(cxgb3_wq);/* wait for external IRQ handler */
+	flush_workqueue(cxgb3_wq);	/* wait for external IRQ handler */
 }
 
 static void schedule_chk_task(struct adapter *adap)
@@ -1338,7 +1356,6 @@ out:
 static int offload_close(struct t3cdev *tdev)
 {
 	struct adapter *adapter = tdev2adap(tdev);
-	struct t3c_data *td = T3C_DATA(tdev);
 
 	if (!test_bit(OFFLOAD_DEVMAP_BIT, &adapter->open_device_map))
 		return 0;
@@ -1349,7 +1366,7 @@ static int offload_close(struct t3cdev *tdev)
 	sysfs_remove_group(&tdev->lldev->dev.kobj, &offload_attr_group);
 
 	/* Flush work scheduled while releasing TIDs */
-	flush_work_sync(&td->tid_release_task);
+	flush_scheduled_work();
 
 	tdev->lldev = NULL;
 	cxgb3_set_dummy_ops(tdev);
@@ -1357,7 +1374,7 @@ static int offload_close(struct t3cdev *tdev)
 	clear_bit(OFFLOAD_DEVMAP_BIT, &adapter->open_device_map);
 
 	if (!adapter->open_device_map)
-		cxgb_down(adapter, 0);
+		cxgb_down(adapter);
 
 	cxgb3_offload_deactivate(adapter);
 	return 0;
@@ -1381,10 +1398,7 @@ static int cxgb_open(struct net_device *dev)
 			       "Could not initialize offload capabilities\n");
 	}
 
-	netif_set_real_num_tx_queues(dev, pi->nqsets);
-	err = netif_set_real_num_rx_queues(dev, pi->nqsets);
-	if (err)
-		return err;
+	dev->real_num_tx_queues = pi->nqsets;
 	link_start(dev);
 	t3_port_intr_enable(adapter, pi->port_id);
 	netif_tx_start_all_queues(dev);
@@ -1395,7 +1409,7 @@ static int cxgb_open(struct net_device *dev)
 	return 0;
 }
 
-static int __cxgb_close(struct net_device *dev, int on_wq)
+static int cxgb_close(struct net_device *dev)
 {
 	struct port_info *pi = netdev_priv(dev);
 	struct adapter *adapter = pi->adapter;
@@ -1422,15 +1436,10 @@ static int __cxgb_close(struct net_device *dev, int on_wq)
 		cancel_delayed_work_sync(&adapter->adap_check_task);
 
 	if (!adapter->open_device_map)
-		cxgb_down(adapter, on_wq);
+		cxgb_down(adapter);
 
 	cxgb3_event_notify(&adapter->tdev, OFFLOAD_PORT_DOWN, pi->port_id);
 	return 0;
-}
-
-static int cxgb_close(struct net_device *dev)
-{
-	return __cxgb_close(dev, 0);
 }
 
 static struct net_device_stats *cxgb_get_stats(struct net_device *dev)
@@ -1728,26 +1737,23 @@ static int restart_autoneg(struct net_device *dev)
 	return 0;
 }
 
-static int set_phys_id(struct net_device *dev,
-		       enum ethtool_phys_id_state state)
+static int cxgb3_phys_id(struct net_device *dev, u32 data)
 {
 	struct port_info *pi = netdev_priv(dev);
 	struct adapter *adapter = pi->adapter;
+	int i;
 
-	switch (state) {
-	case ETHTOOL_ID_ACTIVE:
-		return 1;	/* cycle on/off once per second */
+	if (data == 0)
+		data = 2;
 
-	case ETHTOOL_ID_OFF:
-		t3_set_reg_field(adapter, A_T3DBG_GPIO_EN, F_GPIO0_OUT_VAL, 0);
-		break;
-
-	case ETHTOOL_ID_ON:
-	case ETHTOOL_ID_INACTIVE:
+	for (i = 0; i < data * 2; i++) {
 		t3_set_reg_field(adapter, A_T3DBG_GPIO_EN, F_GPIO0_OUT_VAL,
-			 F_GPIO0_OUT_VAL);
+				 (i & 1) ? F_GPIO0_OUT_VAL : 0);
+		if (msleep_interruptible(500))
+			break;
 	}
-
+	t3_set_reg_field(adapter, A_T3DBG_GPIO_EN, F_GPIO0_OUT_VAL,
+			 F_GPIO0_OUT_VAL);
 	return 0;
 }
 
@@ -1759,10 +1765,10 @@ static int get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 	cmd->advertising = p->link_config.advertising;
 
 	if (netif_carrier_ok(dev)) {
-		ethtool_cmd_speed_set(cmd, p->link_config.speed);
+		cmd->speed = p->link_config.speed;
 		cmd->duplex = p->link_config.duplex;
 	} else {
-		ethtool_cmd_speed_set(cmd, -1);
+		cmd->speed = -1;
 		cmd->duplex = -1;
 	}
 
@@ -1821,8 +1827,7 @@ static int set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 		 * being requested.
 		 */
 		if (cmd->autoneg == AUTONEG_DISABLE) {
-			u32 speed = ethtool_cmd_speed(cmd);
-			int cap = speed_duplex_to_caps(speed, cmd->duplex);
+			int cap = speed_duplex_to_caps(cmd->speed, cmd->duplex);
 			if (lc->supported & cap)
 				return 0;
 		}
@@ -1830,12 +1835,11 @@ static int set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 	}
 
 	if (cmd->autoneg == AUTONEG_DISABLE) {
-		u32 speed = ethtool_cmd_speed(cmd);
-		int cap = speed_duplex_to_caps(speed, cmd->duplex);
+		int cap = speed_duplex_to_caps(cmd->speed, cmd->duplex);
 
-		if (!(lc->supported & cap) || (speed == SPEED_1000))
+		if (!(lc->supported & cap) || cmd->speed == SPEED_1000)
 			return -EINVAL;
-		lc->requested_speed = speed;
+		lc->requested_speed = cmd->speed;
 		lc->requested_duplex = cmd->duplex;
 		lc->advertising = 0;
 	} else {
@@ -1887,6 +1891,29 @@ static int set_pauseparam(struct net_device *dev,
 		lc->fc = lc->requested_fc & (PAUSE_RX | PAUSE_TX);
 		if (netif_running(dev))
 			t3_mac_set_speed_duplex_fc(&p->mac, -1, -1, lc->fc);
+	}
+	return 0;
+}
+
+static u32 get_rx_csum(struct net_device *dev)
+{
+	struct port_info *p = netdev_priv(dev);
+
+	return p->rx_offload & T3_RX_CSUM;
+}
+
+static int set_rx_csum(struct net_device *dev, u32 data)
+{
+	struct port_info *p = netdev_priv(dev);
+
+	if (data) {
+		p->rx_offload |= T3_RX_CSUM;
+	} else {
+		int i;
+
+		p->rx_offload &= ~(T3_RX_CSUM | T3_LRO);
+		for (i = p->first_qset; i < p->first_qset + p->nqsets; i++)
+			set_qset_lro(dev, i, 0);
 	}
 	return 0;
 }
@@ -1944,20 +1971,14 @@ static int set_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
 {
 	struct port_info *pi = netdev_priv(dev);
 	struct adapter *adapter = pi->adapter;
-	struct qset_params *qsp;
-	struct sge_qset *qs;
-	int i;
+	struct qset_params *qsp = &adapter->params.sge.qset[0];
+	struct sge_qset *qs = &adapter->sge.qs[0];
 
 	if (c->rx_coalesce_usecs * 10 > M_NEWTIMER)
 		return -EINVAL;
 
-	for (i = 0; i < pi->nqsets; i++) {
-		qsp = &adapter->params.sge.qset[i];
-		qs = &adapter->sge.qs[i];
-		qsp->coalesce_usecs = c->rx_coalesce_usecs;
-		t3_update_qset_coalesce(qs, qsp);
-	}
-
+	qsp->coalesce_usecs = c->rx_coalesce_usecs;
+	t3_update_qset_coalesce(qs, qsp);
 	return 0;
 }
 
@@ -2062,15 +2083,20 @@ static const struct ethtool_ops cxgb_ethtool_ops = {
 	.set_eeprom = set_eeprom,
 	.get_pauseparam = get_pauseparam,
 	.set_pauseparam = set_pauseparam,
+	.get_rx_csum = get_rx_csum,
+	.set_rx_csum = set_rx_csum,
+	.set_tx_csum = ethtool_op_set_tx_csum,
+	.set_sg = ethtool_op_set_sg,
 	.get_link = ethtool_op_get_link,
 	.get_strings = get_strings,
-	.set_phys_id = set_phys_id,
+	.phys_id = cxgb3_phys_id,
 	.nway_reset = restart_autoneg,
 	.get_sset_count = get_sset_count,
 	.get_ethtool_stats = get_stats,
 	.get_regs_len = get_regs_len,
 	.get_regs = get_regs,
 	.get_wol = get_wol,
+	.set_tso = ethtool_op_set_tso,
 };
 
 static int in_range(int val, int lo, int hi)
@@ -2117,6 +2143,15 @@ static int cxgb_extension_ioctl(struct net_device *dev, void __user *useraddr)
 		    !in_range(t.rspq_size, MIN_RSPQ_ENTRIES,
 			      MAX_RSPQ_ENTRIES))
 			return -EINVAL;
+
+		if ((adapter->flags & FULL_INIT_DONE) && t.lro > 0)
+			for_each_port(adapter, i) {
+				pi = adap2pinfo(adapter, i);
+				if (t.qset_idx >= pi->first_qset &&
+				    t.qset_idx < pi->first_qset + pi->nqsets &&
+				    !(pi->rx_offload & T3_RX_CSUM))
+					return -EINVAL;
+			}
 
 		if ((adapter->flags & FULL_INIT_DONE) &&
 			(t.rspq_size >= 0 || t.fl_size[0] >= 0 ||
@@ -2178,14 +2213,8 @@ static int cxgb_extension_ioctl(struct net_device *dev, void __user *useraddr)
 				}
 			}
 		}
-
-		if (t.lro >= 0) {
-			if (t.lro)
-				dev->wanted_features |= NETIF_F_GRO;
-			else
-				dev->wanted_features &= ~NETIF_F_GRO;
-			netdev_update_features(dev);
-		}
+		if (t.lro >= 0)
+			set_qset_lro(dev, t.qset_idx, t.lro);
 
 		break;
 	}
@@ -2219,7 +2248,7 @@ static int cxgb_extension_ioctl(struct net_device *dev, void __user *useraddr)
 		t.fl_size[0] = q->fl_size;
 		t.fl_size[1] = q->jumbo_size;
 		t.polling = q->polling;
-		t.lro = !!(dev->features & NETIF_F_GRO);
+		t.lro = q->lro;
 		t.intr_lat = q->coalesce_usecs;
 		t.cong_thres = q->cong_thres;
 		t.qnum = q1;
@@ -2284,9 +2313,15 @@ static int cxgb_extension_ioctl(struct net_device *dev, void __user *useraddr)
 		if (copy_from_user(&t, useraddr, sizeof(t)))
 			return -EFAULT;
 		/* Check t.len sanity ? */
-		fw_data = memdup_user(useraddr + sizeof(t), t.len);
-		if (IS_ERR(fw_data))
-			return PTR_ERR(fw_data);
+		fw_data = kmalloc(t.len, GFP_KERNEL);
+		if (!fw_data)
+			return -ENOMEM;
+
+		if (copy_from_user
+			(fw_data, useraddr + sizeof(t), t.len)) {
+			kfree(fw_data);
+			return -EFAULT;
+		}
 
 		ret = t3_load_fw(adapter, fw_data, t.len);
 		kfree(fw_data);
@@ -2835,7 +2870,7 @@ void t3_os_link_fault_handler(struct adapter *adapter, int port_id)
 	spin_unlock(&adapter->work_lock);
 }
 
-static int t3_adapter_error(struct adapter *adapter, int reset, int on_wq)
+static int t3_adapter_error(struct adapter *adapter, int reset)
 {
 	int i, ret = 0;
 
@@ -2850,7 +2885,7 @@ static int t3_adapter_error(struct adapter *adapter, int reset, int on_wq)
 		struct net_device *netdev = adapter->port[i];
 
 		if (netif_running(netdev))
-			__cxgb_close(netdev, on_wq);
+			cxgb_close(netdev);
 	}
 
 	/* Stop SGE timers */
@@ -2921,7 +2956,7 @@ static void fatal_error_task(struct work_struct *work)
 	int err = 0;
 
 	rtnl_lock();
-	err = t3_adapter_error(adapter, 1, 1);
+	err = t3_adapter_error(adapter, 1);
 	if (!err)
 		err = t3_reenable_adapter(adapter);
 	if (!err)
@@ -2966,11 +3001,12 @@ static pci_ers_result_t t3_io_error_detected(struct pci_dev *pdev,
 					     pci_channel_state_t state)
 {
 	struct adapter *adapter = pci_get_drvdata(pdev);
+	int ret;
 
 	if (state == pci_channel_io_perm_failure)
 		return PCI_ERS_RESULT_DISCONNECT;
 
-	t3_adapter_error(adapter, 0, 0);
+	ret = t3_adapter_error(adapter, 0);
 
 	/* Request a slot reset. */
 	return PCI_ERS_RESULT_NEED_RESET;
@@ -3170,17 +3206,17 @@ static int __devinit init_one(struct pci_dev *pdev,
 		}
 	}
 
-	err = pci_enable_device(pdev);
-	if (err) {
-		dev_err(&pdev->dev, "cannot enable PCI device\n");
-		goto out;
-	}
-
 	err = pci_request_regions(pdev, DRV_NAME);
 	if (err) {
 		/* Just info, some other driver may have claimed the device. */
 		dev_info(&pdev->dev, "cannot obtain PCI resources\n");
-		goto out_disable_device;
+		return err;
+	}
+
+	err = pci_enable_device(pdev);
+	if (err) {
+		dev_err(&pdev->dev, "cannot enable PCI device\n");
+		goto out_release_regions;
 	}
 
 	if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(64))) {
@@ -3189,11 +3225,11 @@ static int __devinit init_one(struct pci_dev *pdev,
 		if (err) {
 			dev_err(&pdev->dev, "unable to obtain 64-bit DMA for "
 			       "coherent allocations\n");
-			goto out_release_regions;
+			goto out_disable_device;
 		}
 	} else if ((err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32))) != 0) {
 		dev_err(&pdev->dev, "no usable DMA configuration\n");
-		goto out_release_regions;
+		goto out_disable_device;
 	}
 
 	pci_set_master(pdev);
@@ -3206,7 +3242,7 @@ static int __devinit init_one(struct pci_dev *pdev,
 	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
 	if (!adapter) {
 		err = -ENOMEM;
-		goto out_release_regions;
+		goto out_disable_device;
 	}
 
 	adapter->nofail_skb =
@@ -3257,18 +3293,19 @@ static int __devinit init_one(struct pci_dev *pdev,
 		adapter->port[i] = netdev;
 		pi = netdev_priv(netdev);
 		pi->adapter = adapter;
+		pi->rx_offload = T3_RX_CSUM | T3_LRO;
 		pi->port_id = i;
 		netif_carrier_off(netdev);
+		netif_tx_stop_all_queues(netdev);
 		netdev->irq = pdev->irq;
 		netdev->mem_start = mmio_start;
 		netdev->mem_end = mmio_start + mmio_len - 1;
-		netdev->hw_features = NETIF_F_SG | NETIF_F_IP_CSUM |
-			NETIF_F_TSO | NETIF_F_RXCSUM;
-		netdev->features |= netdev->hw_features |
-			NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_RX;
+		netdev->features |= NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_TSO;
+		netdev->features |= NETIF_F_GRO;
 		if (pci_using_dac)
 			netdev->features |= NETIF_F_HIGHDMA;
 
+		netdev->features |= NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_RX;
 		netdev->netdev_ops = &cxgb_netdev_ops;
 		SET_ETHTOOL_OPS(netdev, &cxgb_ethtool_ops);
 	}
@@ -3341,12 +3378,11 @@ out_free_dev:
 out_free_adapter:
 	kfree(adapter);
 
-out_release_regions:
-	pci_release_regions(pdev);
 out_disable_device:
 	pci_disable_device(pdev);
+out_release_regions:
+	pci_release_regions(pdev);
 	pci_set_drvdata(pdev, NULL);
-out:
 	return err;
 }
 

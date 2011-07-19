@@ -23,13 +23,13 @@
 #include "xfs_sb.h"
 #include "xfs_ag.h"
 #include "xfs_dir2.h"
+#include "xfs_dmapi.h"
 #include "xfs_mount.h"
 #include "xfs_export.h"
 #include "xfs_vnodeops.h"
 #include "xfs_bmap_btree.h"
 #include "xfs_inode.h"
 #include "xfs_inode_item.h"
-#include "xfs_trace.h"
 
 /*
  * Note that we only accept fileids which are long enough rather than allow
@@ -70,16 +70,8 @@ xfs_fs_encode_fh(
 	else
 		fileid_type = FILEID_INO32_GEN_PARENT;
 
-	/*
-	 * If the the filesystem may contain 64bit inode numbers, we need
-	 * to use larger file handles that can represent them.
-	 *
-	 * While we only allocate inodes that do not fit into 32 bits any
-	 * large enough filesystem may contain them, thus the slightly
-	 * confusing looking conditional below.
-	 */
-	if (!(XFS_M(inode->i_sb)->m_flags & XFS_MOUNT_SMALL_INUMS) ||
-	    (XFS_M(inode->i_sb)->m_flags & XFS_MOUNT_32BITINODES))
+	/* filesystem may contain 64bit inode numbers */
+	if (!(XFS_M(inode->i_sb)->m_flags & XFS_MOUNT_SMALL_INUMS))
 		fileid_type |= XFS_FILEID_TYPE_64FLAG;
 
 	/*
@@ -89,10 +81,8 @@ xfs_fs_encode_fh(
 	 * seven combinations work.  The real answer is "don't use v2".
 	 */
 	len = xfs_fileid_length(fileid_type);
-	if (*max_len < len) {
-		*max_len = len;
+	if (*max_len < len)
 		return 255;
-	}
 	*max_len = len;
 
 	switch (fileid_type) {
@@ -142,7 +132,8 @@ xfs_nfs_get_inode(
 	 * fine and not an indication of a corrupted filesystem as clients can
 	 * send invalid file handles and we have to handle it gracefully..
 	 */
-	error = xfs_iget(mp, NULL, ino, XFS_IGET_UNTRUSTED, 0, &ip);
+	error = xfs_iget(mp, NULL, ino, XFS_IGET_UNTRUSTED,
+			 XFS_ILOCK_SHARED, &ip);
 	if (error) {
 		/*
 		 * EINVAL means the inode cluster doesn't exist anymore.
@@ -157,10 +148,11 @@ xfs_nfs_get_inode(
 	}
 
 	if (ip->i_d.di_gen != generation) {
-		IRELE(ip);
+		xfs_iput_new(ip, XFS_ILOCK_SHARED);
 		return ERR_PTR(-ENOENT);
 	}
 
+	xfs_iunlock(ip, XFS_ILOCK_SHARED);
 	return VFS_I(ip);
 }
 

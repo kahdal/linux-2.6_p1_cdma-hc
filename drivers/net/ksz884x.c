@@ -1221,6 +1221,7 @@ struct ksz_port_info {
 #define LINK_INT_WORKING		(1 << 0)
 #define SMALL_PACKET_TX_BUG		(1 << 1)
 #define HALF_DUPLEX_SIGNAL_BUG		(1 << 2)
+#define IPV6_CSUM_GEN_HACK		(1 << 3)
 #define RX_HUGE_FRAME			(1 << 4)
 #define STP_SUPPORT			(1 << 8)
 
@@ -1456,6 +1457,7 @@ struct dev_info {
  * @adapter:		Adapter device information.
  * @port:		Port information.
  * @monitor_time_info:	Timer to monitor ports.
+ * @stats:		Network statistics.
  * @proc_sem:		Semaphore for proc accessing.
  * @id:			Device ID.
  * @mii_if:		MII interface information.
@@ -1469,6 +1471,7 @@ struct dev_priv {
 	struct dev_info *adapter;
 	struct ksz_port port;
 	struct ksz_timer_info monitor_timer_info;
+	struct net_device_stats stats;
 
 	struct semaphore proc_sem;
 	int id;
@@ -3569,7 +3572,7 @@ static void hw_cfg_wol(struct ksz_hw *hw, u16 frame, int set)
  * This routine is used to program Wake-on-LAN pattern.
  */
 static void hw_set_wol_frame(struct ksz_hw *hw, int i, uint mask_size,
-	const u8 *mask, uint frame_size, const u8 *pattern)
+	u8 *mask, uint frame_size, u8 *pattern)
 {
 	int bits;
 	int from;
@@ -3625,9 +3628,9 @@ static void hw_set_wol_frame(struct ksz_hw *hw, int i, uint mask_size,
  *
  * This routine is used to add ARP pattern for waking up the host.
  */
-static void hw_add_wol_arp(struct ksz_hw *hw, const u8 *ip_addr)
+static void hw_add_wol_arp(struct ksz_hw *hw, u8 *ip_addr)
 {
-	static const u8 mask[6] = { 0x3F, 0xF0, 0x3F, 0x00, 0xC0, 0x03 };
+	u8 mask[6] = { 0x3F, 0xF0, 0x3F, 0x00, 0xC0, 0x03 };
 	u8 pattern[42] = {
 		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -3650,8 +3653,8 @@ static void hw_add_wol_arp(struct ksz_hw *hw, const u8 *ip_addr)
  */
 static void hw_add_wol_bcast(struct ksz_hw *hw)
 {
-	static const u8 mask[] = { 0x3F };
-	static const u8 pattern[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+	u8 mask[] = { 0x3F };
+	u8 pattern[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 	hw_set_wol_frame(hw, 2, 1, mask, MAC_ADDR_LEN, pattern);
 }
@@ -3668,7 +3671,7 @@ static void hw_add_wol_bcast(struct ksz_hw *hw)
  */
 static void hw_add_wol_mcast(struct ksz_hw *hw)
 {
-	static const u8 mask[] = { 0x3F };
+	u8 mask[] = { 0x3F };
 	u8 pattern[] = { 0x33, 0x33, 0xFF, 0x00, 0x00, 0x00 };
 
 	memcpy(&pattern[3], &hw->override_addr[3], 3);
@@ -3686,7 +3689,7 @@ static void hw_add_wol_mcast(struct ksz_hw *hw)
  */
 static void hw_add_wol_ucast(struct ksz_hw *hw)
 {
-	static const u8 mask[] = { 0x3F };
+	u8 mask[] = { 0x3F };
 
 	hw_set_wol_frame(hw, 0, 1, mask, MAC_ADDR_LEN, hw->override_addr);
 }
@@ -3699,7 +3702,7 @@ static void hw_add_wol_ucast(struct ksz_hw *hw)
  *
  * This routine is used to enable Wake-on-LAN depending on driver settings.
  */
-static void hw_enable_wol(struct ksz_hw *hw, u32 wol_enable, const u8 *net_addr)
+static void hw_enable_wol(struct ksz_hw *hw, u32 wol_enable, u8 *net_addr)
 {
 	hw_cfg_wol(hw, KS8841_WOL_MAGIC_ENABLE, (wol_enable & WAKE_MAGIC));
 	hw_cfg_wol(hw, KS8841_WOL_FRAME0_ENABLE, (wol_enable & WAKE_UCAST));
@@ -3747,6 +3750,7 @@ static int hw_init(struct ksz_hw *hw)
 		if (1 == rc)
 			hw->features |= HALF_DUPLEX_SIGNAL_BUG;
 	}
+	hw->features |= IPV6_CSUM_GEN_HACK;
 	return rc;
 }
 
@@ -4747,8 +4751,8 @@ static void send_packet(struct sk_buff *skb, struct net_device *dev)
 	hw_send_pkt(hw);
 
 	/* Update transmit statistics. */
-	dev->stats.tx_packets++;
-	dev->stats.tx_bytes += len;
+	priv->stats.tx_packets++;
+	priv->stats.tx_bytes += len;
 }
 
 /**
@@ -4885,7 +4889,8 @@ static netdev_tx_t netdev_tx(struct sk_buff *skb, struct net_device *dev)
 	left = hw_alloc_pkt(hw, skb->len, num);
 	if (left) {
 		if (left < num ||
-				((CHECKSUM_PARTIAL == skb->ip_summed) &&
+				((hw->features & IPV6_CSUM_GEN_HACK) &&
+				(CHECKSUM_PARTIAL == skb->ip_summed) &&
 				(ETH_P_IPV6 == htons(skb->protocol)))) {
 			struct sk_buff *org_skb = skb;
 
@@ -4895,7 +4900,7 @@ static netdev_tx_t netdev_tx(struct sk_buff *skb, struct net_device *dev)
 				goto unlock;
 			}
 			skb_copy_and_csum_dev(org_skb, skb->data);
-			org_skb->ip_summed = CHECKSUM_NONE;
+			org_skb->ip_summed = 0;
 			skb->len = org_skb->len;
 			copy_old_skb(org_skb, skb);
 		}
@@ -5025,7 +5030,7 @@ static inline int rx_proc(struct net_device *dev, struct ksz_hw* hw,
 		/* skb->data != skb->head */
 		skb = dev_alloc_skb(packet_len + 2);
 		if (!skb) {
-			dev->stats.rx_dropped++;
+			priv->stats.rx_dropped++;
 			return -ENOMEM;
 		}
 
@@ -5045,8 +5050,8 @@ static inline int rx_proc(struct net_device *dev, struct ksz_hw* hw,
 		csum_verified(skb);
 
 	/* Update receive statistics. */
-	dev->stats.rx_packets++;
-	dev->stats.rx_bytes += packet_len;
+	priv->stats.rx_packets++;
+	priv->stats.rx_bytes += packet_len;
 
 	/* Notify upper layer for received packet. */
 	rx_status = netif_rx(skb);
@@ -5286,7 +5291,7 @@ static irqreturn_t netdev_intr(int irq, void *dev_id)
 		}
 
 		if (unlikely(int_enable & KS884X_INT_RX_OVERRUN)) {
-			dev->stats.rx_fifo_errors++;
+			priv->stats.rx_fifo_errors++;
 			hw_resume_rx(hw);
 		}
 
@@ -5517,7 +5522,7 @@ static int netdev_open(struct net_device *dev)
 	priv->promiscuous = 0;
 
 	/* Reset device statistics. */
-	memset(&dev->stats, 0, sizeof(struct net_device_stats));
+	memset(&priv->stats, 0, sizeof(struct net_device_stats));
 	memset((void *) port->counter, 0,
 		(sizeof(u64) * OID_COUNTER_LAST));
 
@@ -5617,42 +5622,42 @@ static struct net_device_stats *netdev_query_statistics(struct net_device *dev)
 	int i;
 	int p;
 
-	dev->stats.rx_errors = port->counter[OID_COUNTER_RCV_ERROR];
-	dev->stats.tx_errors = port->counter[OID_COUNTER_XMIT_ERROR];
+	priv->stats.rx_errors = port->counter[OID_COUNTER_RCV_ERROR];
+	priv->stats.tx_errors = port->counter[OID_COUNTER_XMIT_ERROR];
 
 	/* Reset to zero to add count later. */
-	dev->stats.multicast = 0;
-	dev->stats.collisions = 0;
-	dev->stats.rx_length_errors = 0;
-	dev->stats.rx_crc_errors = 0;
-	dev->stats.rx_frame_errors = 0;
-	dev->stats.tx_window_errors = 0;
+	priv->stats.multicast = 0;
+	priv->stats.collisions = 0;
+	priv->stats.rx_length_errors = 0;
+	priv->stats.rx_crc_errors = 0;
+	priv->stats.rx_frame_errors = 0;
+	priv->stats.tx_window_errors = 0;
 
 	for (i = 0, p = port->first_port; i < port->mib_port_cnt; i++, p++) {
 		mib = &hw->port_mib[p];
 
-		dev->stats.multicast += (unsigned long)
+		priv->stats.multicast += (unsigned long)
 			mib->counter[MIB_COUNTER_RX_MULTICAST];
 
-		dev->stats.collisions += (unsigned long)
+		priv->stats.collisions += (unsigned long)
 			mib->counter[MIB_COUNTER_TX_TOTAL_COLLISION];
 
-		dev->stats.rx_length_errors += (unsigned long)(
+		priv->stats.rx_length_errors += (unsigned long)(
 			mib->counter[MIB_COUNTER_RX_UNDERSIZE] +
 			mib->counter[MIB_COUNTER_RX_FRAGMENT] +
 			mib->counter[MIB_COUNTER_RX_OVERSIZE] +
 			mib->counter[MIB_COUNTER_RX_JABBER]);
-		dev->stats.rx_crc_errors += (unsigned long)
+		priv->stats.rx_crc_errors += (unsigned long)
 			mib->counter[MIB_COUNTER_RX_CRC_ERR];
-		dev->stats.rx_frame_errors += (unsigned long)(
+		priv->stats.rx_frame_errors += (unsigned long)(
 			mib->counter[MIB_COUNTER_RX_ALIGNMENT_ERR] +
 			mib->counter[MIB_COUNTER_RX_SYMBOL_ERR]);
 
-		dev->stats.tx_window_errors += (unsigned long)
+		priv->stats.tx_window_errors += (unsigned long)
 			mib->counter[MIB_COUNTER_TX_LATE_COLLISION];
 	}
 
-	return &dev->stats;
+	return &priv->stats;
 }
 
 /**
@@ -5713,7 +5718,7 @@ static void dev_set_promiscuous(struct net_device *dev, struct dev_priv *priv,
 		 * from the bridge.
 		 */
 		if ((hw->features & STP_SUPPORT) && !promiscuous &&
-		    (dev->priv_flags & IFF_BRIDGE_PORT)) {
+				dev->br_port) {
 			struct ksz_switch *sw = hw->ksz_switch;
 			int port = priv->port.first_port;
 
@@ -5998,7 +6003,6 @@ static int netdev_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 	struct dev_priv *priv = netdev_priv(dev);
 	struct dev_info *hw_priv = priv->adapter;
 	struct ksz_port *port = &priv->port;
-	u32 speed = ethtool_cmd_speed(cmd);
 	int rc;
 
 	/*
@@ -6007,11 +6011,11 @@ static int netdev_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 	 */
 	if (cmd->autoneg && priv->advertising == cmd->advertising) {
 		cmd->advertising |= ADVERTISED_ALL;
-		if (10 == speed)
+		if (10 == cmd->speed)
 			cmd->advertising &=
 				~(ADVERTISED_100baseT_Full |
 				ADVERTISED_100baseT_Half);
-		else if (100 == speed)
+		else if (100 == cmd->speed)
 			cmd->advertising &=
 				~(ADVERTISED_10baseT_Full |
 				ADVERTISED_10baseT_Half);
@@ -6033,8 +6037,8 @@ static int netdev_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 		port->force_link = 0;
 	} else {
 		port->duplex = cmd->duplex + 1;
-		if (1000 != speed)
-			port->speed = speed;
+		if (cmd->speed != 1000)
+			port->speed = cmd->speed;
 		if (cmd->autoneg)
 			port->force_link = 0;
 		else
@@ -6206,7 +6210,7 @@ static int netdev_set_wol(struct net_device *dev,
 	struct dev_info *hw_priv = priv->adapter;
 
 	/* Need to find a way to retrieve the device IP address. */
-	static const u8 net_addr[] = { 192, 168, 1, 1 };
+	u8 net_addr[] = { 192, 168, 1, 1 };
 
 	if (wol->wolopts & ~hw_priv->wol_support)
 		return -EINVAL;
@@ -6581,33 +6585,57 @@ static void netdev_get_ethtool_stats(struct net_device *dev,
 }
 
 /**
- * netdev_set_features - set receive checksum support
+ * netdev_get_rx_csum - get receive checksum support
  * @dev:	Network device.
- * @features:	New device features (offloads).
  *
- * This function sets receive checksum support setting.
+ * This function gets receive checksum support setting.
  *
- * Return 0 if successful; otherwise an error code.
+ * Return true if receive checksum is enabled; false otherwise.
  */
-static int netdev_set_features(struct net_device *dev, u32 features)
+static u32 netdev_get_rx_csum(struct net_device *dev)
 {
 	struct dev_priv *priv = netdev_priv(dev);
 	struct dev_info *hw_priv = priv->adapter;
 	struct ksz_hw *hw = &hw_priv->hw;
 
-	mutex_lock(&hw_priv->lock);
+	return hw->rx_cfg &
+		(DMA_RX_CSUM_UDP |
+		DMA_RX_CSUM_TCP |
+		DMA_RX_CSUM_IP);
+}
 
-	/* see note in hw_setup() */
-	if (features & NETIF_F_RXCSUM)
-		hw->rx_cfg |= DMA_RX_CSUM_TCP | DMA_RX_CSUM_IP;
+/**
+ * netdev_set_rx_csum - set receive checksum support
+ * @dev:	Network device.
+ * @data:	Zero to disable receive checksum support.
+ *
+ * This function sets receive checksum support setting.
+ *
+ * Return 0 if successful; otherwise an error code.
+ */
+static int netdev_set_rx_csum(struct net_device *dev, u32 data)
+{
+	struct dev_priv *priv = netdev_priv(dev);
+	struct dev_info *hw_priv = priv->adapter;
+	struct ksz_hw *hw = &hw_priv->hw;
+	u32 new_setting = hw->rx_cfg;
+
+	if (data)
+		new_setting |=
+			(DMA_RX_CSUM_UDP | DMA_RX_CSUM_TCP |
+			DMA_RX_CSUM_IP);
 	else
-		hw->rx_cfg &= ~(DMA_RX_CSUM_TCP | DMA_RX_CSUM_IP);
-
-	if (hw->enabled)
-		writel(hw->rx_cfg, hw->io + KS_DMA_RX_CTRL);
-
+		new_setting &=
+			~(DMA_RX_CSUM_UDP | DMA_RX_CSUM_TCP |
+			DMA_RX_CSUM_IP);
+	new_setting &= ~DMA_RX_CSUM_UDP;
+	mutex_lock(&hw_priv->lock);
+	if (new_setting != hw->rx_cfg) {
+		hw->rx_cfg = new_setting;
+		if (hw->enabled)
+			writel(hw->rx_cfg, hw->io + KS_DMA_RX_CTRL);
+	}
 	mutex_unlock(&hw_priv->lock);
-
 	return 0;
 }
 
@@ -6632,6 +6660,12 @@ static struct ethtool_ops netdev_ethtool_ops = {
 	.get_strings		= netdev_get_strings,
 	.get_sset_count		= netdev_get_sset_count,
 	.get_ethtool_stats	= netdev_get_ethtool_stats,
+	.get_rx_csum		= netdev_get_rx_csum,
+	.set_rx_csum		= netdev_set_rx_csum,
+	.get_tx_csum		= ethtool_op_get_tx_csum,
+	.set_tx_csum		= ethtool_op_set_tx_csum,
+	.get_sg			= ethtool_op_get_sg,
+	.set_sg			= ethtool_op_set_sg,
 };
 
 /*
@@ -6778,7 +6812,7 @@ static int stp;
 static int fast_aging;
 
 /**
- * netdev_init - initialize network device.
+ * netdev_init - initalize network device.
  * @dev:	Network device.
  *
  * This function initializes the network device.
@@ -6796,15 +6830,14 @@ static int __init netdev_init(struct net_device *dev)
 	/* 500 ms timeout */
 	dev->watchdog_timeo = HZ / 2;
 
-	dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_SG | NETIF_F_RXCSUM;
+	dev->features |= NETIF_F_IP_CSUM;
 
 	/*
 	 * Hardware does not really support IPv6 checksum generation, but
-	 * driver actually runs faster with this on.
+	 * driver actually runs faster with this on.  Refer IPV6_CSUM_GEN_HACK.
 	 */
-	dev->hw_features |= NETIF_F_IPV6_CSUM;
-
-	dev->features |= dev->hw_features;
+	dev->features |= NETIF_F_IPV6_CSUM;
+	dev->features |= NETIF_F_SG;
 
 	sema_init(&priv->proc_sem, 1);
 
@@ -6829,7 +6862,6 @@ static const struct net_device_ops netdev_ops = {
 	.ndo_start_xmit		= netdev_tx,
 	.ndo_tx_timeout		= netdev_tx_timeout,
 	.ndo_change_mtu		= netdev_change_mtu,
-	.ndo_set_features	= netdev_set_features,
 	.ndo_set_mac_address	= netdev_set_mac_address,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_do_ioctl		= netdev_ioctl,
@@ -6864,12 +6896,13 @@ static void get_mac_addr(struct dev_info *hw_priv, u8 *macaddr, int port)
 	i = j = num = got_num = 0;
 	while (j < MAC_ADDR_LEN) {
 		if (macaddr[i]) {
-			int digit;
-
 			got_num = 1;
-			digit = hex_to_bin(macaddr[i]);
-			if (digit >= 0)
-				num = num * 16 + digit;
+			if ('0' <= macaddr[i] && macaddr[i] <= '9')
+				num = num * 16 + macaddr[i] - '0';
+			else if ('A' <= macaddr[i] && macaddr[i] <= 'F')
+				num = num * 16 + 10 + macaddr[i] - 'A';
+			else if ('a' <= macaddr[i] && macaddr[i] <= 'f')
+				num = num * 16 + 10 + macaddr[i] - 'a';
 			else if (':' == macaddr[i])
 				got_num = 2;
 			else
@@ -6923,7 +6956,7 @@ static void read_other_addr(struct ksz_hw *hw)
 #define PCI_VENDOR_ID_MICREL_KS		0x16c6
 #endif
 
-static int __devinit pcidev_init(struct pci_dev *pdev,
+static int __init pcidev_init(struct pci_dev *pdev,
 	const struct pci_device_id *id)
 {
 	struct net_device *dev;
@@ -7211,7 +7244,7 @@ static int pcidev_suspend(struct pci_dev *pdev, pm_message_t state)
 	struct ksz_hw *hw = &hw_priv->hw;
 
 	/* Need to find a way to retrieve the device IP address. */
-	static const u8 net_addr[] = { 192, 168, 1, 1 };
+	u8 net_addr[] = { 192, 168, 1, 1 };
 
 	for (i = 0; i < hw->dev_count; i++) {
 		if (info->netdev[i]) {

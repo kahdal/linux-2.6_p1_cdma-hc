@@ -295,7 +295,8 @@ enum dmfe_CR6_bits {
 /* Global variable declaration ----------------------------- */
 static int __devinitdata printed_version;
 static const char version[] __devinitconst =
-	"Davicom DM9xxx net driver, version " DRV_VERSION " (" DRV_RELDATE ")";
+	KERN_INFO DRV_NAME ": Davicom DM9xxx net driver, version "
+	DRV_VERSION " (" DRV_RELDATE ")\n";
 
 static int dmfe_debug;
 static unsigned char dmfe_media_mode = DMFE_AUTO;
@@ -380,7 +381,7 @@ static int __devinit dmfe_init_one (struct pci_dev *pdev,
 	DMFE_DBUG(0, "dmfe_init_one()", 0);
 
 	if (!printed_version++)
-		pr_info("%s\n", version);
+		printk(version);
 
 	/*
 	 *	SPARC on-board DM910x chips should be handled by the main
@@ -405,7 +406,7 @@ static int __devinit dmfe_init_one (struct pci_dev *pdev,
 	SET_NETDEV_DEV(dev, &pdev->dev);
 
 	if (pci_set_dma_mask(pdev, DMA_BIT_MASK(32))) {
-		pr_warn("32-bit PCI DMA not available\n");
+		pr_warning("32-bit PCI DMA not available\n");
 		err = -ENODEV;
 		goto err_out_free;
 	}
@@ -588,7 +589,7 @@ static int dmfe_open(struct DEVICE *dev)
 		db->dm910x_chk_mode = 1;	/* Enter the check mode */
 	}
 
-	/* Initialize DM910X board */
+	/* Initilize DM910X board */
 	dmfe_init_dm910x(dev);
 
 	/* Active System Interface */
@@ -598,16 +599,16 @@ static int dmfe_open(struct DEVICE *dev)
 	init_timer(&db->timer);
 	db->timer.expires = DMFE_TIMER_WUT + HZ * 2;
 	db->timer.data = (unsigned long)dev;
-	db->timer.function = dmfe_timer;
+	db->timer.function = &dmfe_timer;
 	add_timer(&db->timer);
 
 	return 0;
 }
 
 
-/*	Initialize DM910X board
+/*	Initilize DM910X board
  *	Reset DM910X board
- *	Initialize TX/Rx descriptor chain structure
+ *	Initilize TX/Rx descriptor chain structure
  *	Send the set-up frame
  *	Enable Tx/Rx machine
  */
@@ -648,7 +649,7 @@ static void dmfe_init_dm910x(struct DEVICE *dev)
 	if ( !(db->media_mode & DMFE_AUTO) )
 		db->op_mode = db->media_mode; 	/* Force Mode */
 
-	/* Initialize Transmit/Receive decriptor and CR3/4 */
+	/* Initiliaze Transmit/Receive decriptor and CR3/4 */
 	dmfe_descriptor_init(db, ioaddr);
 
 	/* Init CR6 to program DM910x operation */
@@ -687,15 +688,15 @@ static netdev_tx_t dmfe_start_xmit(struct sk_buff *skb,
 
 	DMFE_DBUG(0, "dmfe_start_xmit", 0);
 
+	/* Resource flag check */
+	netif_stop_queue(dev);
+
 	/* Too large packet check */
 	if (skb->len > MAX_PACKET_SIZE) {
 		pr_err("big packet = %d\n", (u16)skb->len);
 		dev_kfree_skb(skb);
 		return NETDEV_TX_OK;
 	}
-
-	/* Resource flag check */
-	netif_stop_queue(dev);
 
 	spin_lock_irqsave(&db->lock, flags);
 
@@ -879,6 +880,7 @@ static void dmfe_free_tx_pkt(struct DEVICE *dev, struct dmfe_board_info * db)
 	txptr = db->tx_remove_ptr;
 	while(db->tx_packet_cnt) {
 		tdes0 = le32_to_cpu(txptr->tdes0);
+		pr_debug("tdes0=%x\n", tdes0);
 		if (tdes0 & 0x80000000)
 			break;
 
@@ -888,6 +890,7 @@ static void dmfe_free_tx_pkt(struct DEVICE *dev, struct dmfe_board_info * db)
 
 		/* Transmit statistic counter */
 		if ( tdes0 != 0x7fffffff ) {
+			pr_debug("tdes0=%x\n", tdes0);
 			dev->stats.collisions += (tdes0 >> 3) & 0xf;
 			dev->stats.tx_bytes += le32_to_cpu(txptr->tdes1) & 0x7ff;
 			if (tdes0 & TDES0_ERR_MASK) {
@@ -984,6 +987,7 @@ static void dmfe_rx_packet(struct DEVICE *dev, struct dmfe_board_info * db)
 			/* error summary bit check */
 			if (rdes0 & 0x8000) {
 				/* This is a error packet */
+				pr_debug("rdes0: %x\n", rdes0);
 				dev->stats.rx_errors++;
 				if (rdes0 & 1)
 					dev->stats.rx_fifo_errors++;
@@ -1220,7 +1224,7 @@ static void dmfe_timer(unsigned long data)
 
 
 	/* If chip reports that link is failed it could be because external
-		PHY link status pin is not connected correctly to chip
+		PHY link status pin is not conected correctly to chip
 		To be sure ask PHY too.
 	*/
 
@@ -1284,7 +1288,7 @@ static void dmfe_timer(unsigned long data)
  *	Stop DM910X board
  *	Free Tx/Rx allocated memory
  *	Reset DM910X board
- *	Re-initialize DM910X board
+ *	Re-initilize DM910X board
  */
 
 static void dmfe_dynamic_reset(struct DEVICE *dev)
@@ -1312,7 +1316,7 @@ static void dmfe_dynamic_reset(struct DEVICE *dev)
 	netif_carrier_off(dev);
 	db->wait_reset = 0;
 
-	/* Re-initialize DM910X board */
+	/* Re-initilize DM910X board */
 	dmfe_init_dm910x(dev);
 
 	/* Restart upper layer interface */
@@ -1443,7 +1447,7 @@ static void update_cr6(u32 cr6_data, unsigned long ioaddr)
 
 /*
  *	Send a setup frame for DM9132
- *	This setup frame initialize DM910X address filter mode
+ *	This setup frame initilize DM910X address filter mode
 */
 
 static void dm9132_id_table(struct DEVICE *dev)
@@ -1485,7 +1489,7 @@ static void dm9132_id_table(struct DEVICE *dev)
 
 /*
  *	Send a setup frame for DM9102/DM9102A
- *	This setup frame initialize DM910X address filter mode
+ *	This setup frame initilize DM910X address filter mode
  */
 
 static void send_filter_frame(struct DEVICE *dev)
@@ -1635,6 +1639,7 @@ static u8 dmfe_sense_speed(struct dmfe_board_info * db)
 		else 				/* DM9102/DM9102A */
 			phy_mode = phy_read(db->ioaddr,
 				    db->phy_addr, 17, db->chip_id) & 0xf000;
+		pr_debug("Phy_mode %x\n", phy_mode);
 		switch (phy_mode) {
 		case 0x1000: db->op_mode = DMFE_10MHF; break;
 		case 0x2000: db->op_mode = DMFE_10MFD; break;
@@ -2137,7 +2142,7 @@ static int dmfe_resume(struct pci_dev *pci_dev)
 	pci_set_power_state(pci_dev, PCI_D0);
 	pci_restore_state(pci_dev);
 
-	/* Re-initialize DM910X board */
+	/* Re-initilize DM910X board */
 	dmfe_init_dm910x(dev);
 
 	/* Disable WOL */
@@ -2191,14 +2196,14 @@ MODULE_PARM_DESC(SF_mode, "Davicom DM9xxx special function "
 
 /*	Description:
  *	when user used insmod to add module, system invoked init_module()
- *	to initialize and register.
+ *	to initilize and register.
  */
 
 static int __init dmfe_init_module(void)
 {
 	int rc;
 
-	pr_info("%s\n", version);
+	printk(version);
 	printed_version = 1;
 
 	DMFE_DBUG(0, "init_module() ", debug);

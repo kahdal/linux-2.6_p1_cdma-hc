@@ -16,8 +16,7 @@
 
 static int load_script(struct linux_binprm *bprm,struct pt_regs *regs)
 {
-	const char *i_arg, *i_name;
-	char *cp;
+	char *cp, *i_name, *i_arg;
 	struct file *file;
 	char interp[BINPRM_BUF_SIZE];
 	int retval;

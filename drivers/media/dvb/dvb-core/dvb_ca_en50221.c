@@ -36,6 +36,7 @@
 #include <linux/delay.h>
 #include <linux/spinlock.h>
 #include <linux/sched.h>
+#include <linux/smp_lock.h>
 #include <linux/kthread.h>
 
 #include "dvb_ca_en50221.h"
@@ -1258,7 +1259,13 @@ static int dvb_ca_en50221_io_do_ioctl(struct file *file,
 static long dvb_ca_en50221_io_ioctl(struct file *file,
 				    unsigned int cmd, unsigned long arg)
 {
-	return dvb_usercopy(file, cmd, arg, dvb_ca_en50221_io_do_ioctl);
+	int ret;
+
+	lock_kernel();
+	ret = dvb_usercopy(file, cmd, arg, dvb_ca_en50221_io_do_ioctl);
+	unlock_kernel();
+
+	return ret;
 }
 
 
@@ -1311,11 +1318,8 @@ static ssize_t dvb_ca_en50221_io_write(struct file *file,
 
 		fragbuf[0] = connection_id;
 		fragbuf[1] = ((fragpos + fraglen) < count) ? 0x80 : 0x00;
-		status = copy_from_user(fragbuf + 2, buf + fragpos, fraglen);
-		if (status) {
-			status = -EFAULT;
+		if ((status = copy_from_user(fragbuf + 2, buf + fragpos, fraglen)) != 0)
 			goto exit;
-		}
 
 		timeout = jiffies + HZ / 2;
 		written = 0;
@@ -1490,11 +1494,8 @@ static ssize_t dvb_ca_en50221_io_read(struct file *file, char __user * buf,
 
 	hdr[0] = slot;
 	hdr[1] = connection_id;
-	status = copy_to_user(buf, hdr, 2);
-	if (status) {
-		status = -EFAULT;
+	if ((status = copy_to_user(buf, hdr, 2)) != 0)
 		goto exit;
-	}
 	status = pktlen;
 
 exit:
@@ -1621,7 +1622,6 @@ static const struct file_operations dvb_ca_fops = {
 	.open = dvb_ca_en50221_io_open,
 	.release = dvb_ca_en50221_io_release,
 	.poll = dvb_ca_en50221_io_poll,
-	.llseek = noop_llseek,
 };
 
 static struct dvb_device dvbdev_ca = {

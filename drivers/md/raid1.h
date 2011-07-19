@@ -35,6 +35,8 @@ struct r1_private_data_s {
 	struct list_head	retry_list;
 	/* queue pending writes and submit them on unplug */
 	struct bio_list		pending_bio_list;
+	/* queue of writes that have been unplugged */
+	struct bio_list		flushing_bio_list;
 
 	/* for use when syncing mirrors: */
 
@@ -94,9 +96,7 @@ struct r1bio_s {
 	int			read_disk;
 
 	struct list_head	retry_list;
-	/* Next two are only valid when R1BIO_BehindIO is set */
-	struct page		**behind_pages;
-	int			behind_page_count;
+	struct bitmap_update	*bitmap_update;
 	/*
 	 * if the IO is in WRITE direction, then multiple bios are used.
 	 * We choose the number when they are allocated.
@@ -117,6 +117,8 @@ struct r1bio_s {
 #define	R1BIO_IsSync	1
 #define	R1BIO_Degraded	2
 #define	R1BIO_BehindIO	3
+#define	R1BIO_Barrier	4
+#define R1BIO_BarrierRetry 5
 /* For write-behind requests, we call bi_end_io when
  * the last non-write-behind device completes, providing
  * any write was successful.  Otherwise we call when
@@ -125,7 +127,5 @@ struct r1bio_s {
  * Record that bi_end_io was called with this flag...
  */
 #define	R1BIO_Returned 6
-
-extern int md_raid1_congested(mddev_t *mddev, int bits);
 
 #endif

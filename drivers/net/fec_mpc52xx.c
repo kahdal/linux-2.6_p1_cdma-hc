@@ -366,8 +366,9 @@ static irqreturn_t mpc52xx_fec_tx_interrupt(int irq, void *dev_id)
 {
 	struct net_device *dev = dev_id;
 	struct mpc52xx_fec_priv *priv = netdev_priv(dev);
+	unsigned long flags;
 
-	spin_lock(&priv->lock);
+	spin_lock_irqsave(&priv->lock, flags);
 	while (bcom_buffer_done(priv->tx_dmatsk)) {
 		struct sk_buff *skb;
 		struct bcom_fec_bd *bd;
@@ -378,7 +379,7 @@ static irqreturn_t mpc52xx_fec_tx_interrupt(int irq, void *dev_id)
 
 		dev_kfree_skb_irq(skb);
 	}
-	spin_unlock(&priv->lock);
+	spin_unlock_irqrestore(&priv->lock, flags);
 
 	netif_wake_queue(dev);
 
@@ -394,8 +395,9 @@ static irqreturn_t mpc52xx_fec_rx_interrupt(int irq, void *dev_id)
 	struct bcom_fec_bd *bd;
 	u32 status, physaddr;
 	int length;
+	unsigned long flags;
 
-	spin_lock(&priv->lock);
+	spin_lock_irqsave(&priv->lock, flags);
 
 	while (bcom_buffer_done(priv->rx_dmatsk)) {
 
@@ -427,7 +429,7 @@ static irqreturn_t mpc52xx_fec_rx_interrupt(int irq, void *dev_id)
 
 		/* Process the received skb - Drop the spin lock while
 		 * calling into the network stack */
-		spin_unlock(&priv->lock);
+		spin_unlock_irqrestore(&priv->lock, flags);
 
 		dma_unmap_single(dev->dev.parent, physaddr, rskb->len,
 				 DMA_FROM_DEVICE);
@@ -436,10 +438,10 @@ static irqreturn_t mpc52xx_fec_rx_interrupt(int irq, void *dev_id)
 		rskb->protocol = eth_type_trans(rskb, dev);
 		netif_rx(rskb);
 
-		spin_lock(&priv->lock);
+		spin_lock_irqsave(&priv->lock, flags);
 	}
 
-	spin_unlock(&priv->lock);
+	spin_unlock_irqrestore(&priv->lock, flags);
 
 	return IRQ_HANDLED;
 }
@@ -450,6 +452,7 @@ static irqreturn_t mpc52xx_fec_interrupt(int irq, void *dev_id)
 	struct mpc52xx_fec_priv *priv = netdev_priv(dev);
 	struct mpc52xx_fec __iomem *fec = priv->fec;
 	u32 ievent;
+	unsigned long flags;
 
 	ievent = in_be32(&fec->ievent);
 
@@ -467,9 +470,9 @@ static irqreturn_t mpc52xx_fec_interrupt(int irq, void *dev_id)
 		if (net_ratelimit() && (ievent & FEC_IEVENT_XFIFO_ERROR))
 			dev_warn(&dev->dev, "FEC_IEVENT_XFIFO_ERROR\n");
 
-		spin_lock(&priv->lock);
+		spin_lock_irqsave(&priv->lock, flags);
 		mpc52xx_fec_reset(dev);
-		spin_unlock(&priv->lock);
+		spin_unlock_irqrestore(&priv->lock, flags);
 
 		return IRQ_HANDLED;
 	}
@@ -768,6 +771,11 @@ static void mpc52xx_fec_reset(struct net_device *dev)
 
 
 /* ethtool interface */
+static void mpc52xx_fec_get_drvinfo(struct net_device *dev,
+		struct ethtool_drvinfo *info)
+{
+	strcpy(info->driver, DRIVER_NAME);
+}
 
 static int mpc52xx_fec_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 {
@@ -802,6 +810,7 @@ static void mpc52xx_fec_set_msglevel(struct net_device *dev, u32 level)
 }
 
 static const struct ethtool_ops mpc52xx_fec_ethtool_ops = {
+	.get_drvinfo = mpc52xx_fec_get_drvinfo,
 	.get_settings = mpc52xx_fec_get_settings,
 	.set_settings = mpc52xx_fec_set_settings,
 	.get_link = ethtool_op_get_link,
@@ -817,7 +826,7 @@ static int mpc52xx_fec_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 	if (!priv->phydev)
 		return -ENOTSUPP;
 
-	return phy_mii_ioctl(priv->phydev, rq, cmd);
+	return phy_mii_ioctl(priv->phydev, if_mii(rq), cmd);
 }
 
 static const struct net_device_ops mpc52xx_fec_netdev_ops = {
@@ -840,7 +849,8 @@ static const struct net_device_ops mpc52xx_fec_netdev_ops = {
 /* OF Driver                                                                */
 /* ======================================================================== */
 
-static int __devinit mpc52xx_fec_probe(struct platform_device *op)
+static int __devinit
+mpc52xx_fec_probe(struct of_device *op, const struct of_device_id *match)
 {
 	int rv;
 	struct net_device *ndev;
@@ -865,21 +875,17 @@ static int __devinit mpc52xx_fec_probe(struct platform_device *op)
 	if (rv) {
 		printk(KERN_ERR DRIVER_NAME ": "
 				"Error while parsing device node resource\n" );
-		goto err_netdev;
+		return rv;
 	}
 	if ((mem.end - mem.start + 1) < sizeof(struct mpc52xx_fec)) {
 		printk(KERN_ERR DRIVER_NAME
 			" - invalid resource size (%lx < %x), check mpc52xx_devices.c\n",
 			(unsigned long)(mem.end - mem.start + 1), sizeof(struct mpc52xx_fec));
-		rv = -EINVAL;
-		goto err_netdev;
+		return -EINVAL;
 	}
 
-	if (!request_mem_region(mem.start, sizeof(struct mpc52xx_fec),
-				DRIVER_NAME)) {
-		rv = -EBUSY;
-		goto err_netdev;
-	}
+	if (!request_mem_region(mem.start, sizeof(struct mpc52xx_fec), DRIVER_NAME))
+		return -EBUSY;
 
 	/* Init ether ndev with what we have */
 	ndev->netdev_ops	= &mpc52xx_fec_netdev_ops;
@@ -895,7 +901,7 @@ static int __devinit mpc52xx_fec_probe(struct platform_device *op)
 
 	if (!priv->fec) {
 		rv = -ENOMEM;
-		goto err_mem_region;
+		goto probe_error;
 	}
 
 	/* Bestcomm init */
@@ -908,7 +914,7 @@ static int __devinit mpc52xx_fec_probe(struct platform_device *op)
 	if (!priv->rx_dmatsk || !priv->tx_dmatsk) {
 		printk(KERN_ERR DRIVER_NAME ": Can not init SDMA tasks\n" );
 		rv = -ENOMEM;
-		goto err_rx_tx_dmatsk;
+		goto probe_error;
 	}
 
 	/* Get the IRQ we need one by one */
@@ -960,32 +966,40 @@ static int __devinit mpc52xx_fec_probe(struct platform_device *op)
 
 	rv = register_netdev(ndev);
 	if (rv < 0)
-		goto err_node;
+		goto probe_error;
 
 	/* We're done ! */
 	dev_set_drvdata(&op->dev, ndev);
 
 	return 0;
 
-err_node:
-	of_node_put(priv->phy_node);
+
+	/* Error handling - free everything that might be allocated */
+probe_error:
+
+	if (priv->phy_node)
+		of_node_put(priv->phy_node);
+	priv->phy_node = NULL;
+
 	irq_dispose_mapping(ndev->irq);
-err_rx_tx_dmatsk:
+
 	if (priv->rx_dmatsk)
 		bcom_fec_rx_release(priv->rx_dmatsk);
 	if (priv->tx_dmatsk)
 		bcom_fec_tx_release(priv->tx_dmatsk);
-	iounmap(priv->fec);
-err_mem_region:
+
+	if (priv->fec)
+		iounmap(priv->fec);
+
 	release_mem_region(mem.start, sizeof(struct mpc52xx_fec));
-err_netdev:
+
 	free_netdev(ndev);
 
 	return rv;
 }
 
 static int
-mpc52xx_fec_remove(struct platform_device *op)
+mpc52xx_fec_remove(struct of_device *op)
 {
 	struct net_device *ndev;
 	struct mpc52xx_fec_priv *priv;
@@ -1015,7 +1029,7 @@ mpc52xx_fec_remove(struct platform_device *op)
 }
 
 #ifdef CONFIG_PM
-static int mpc52xx_fec_of_suspend(struct platform_device *op, pm_message_t state)
+static int mpc52xx_fec_of_suspend(struct of_device *op, pm_message_t state)
 {
 	struct net_device *dev = dev_get_drvdata(&op->dev);
 
@@ -1025,7 +1039,7 @@ static int mpc52xx_fec_of_suspend(struct platform_device *op, pm_message_t state
 	return 0;
 }
 
-static int mpc52xx_fec_of_resume(struct platform_device *op)
+static int mpc52xx_fec_of_resume(struct of_device *op)
 {
 	struct net_device *dev = dev_get_drvdata(&op->dev);
 
@@ -1048,7 +1062,7 @@ static struct of_device_id mpc52xx_fec_match[] = {
 
 MODULE_DEVICE_TABLE(of, mpc52xx_fec_match);
 
-static struct platform_driver mpc52xx_fec_driver = {
+static struct of_platform_driver mpc52xx_fec_driver = {
 	.driver = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
@@ -1072,21 +1086,21 @@ mpc52xx_fec_init(void)
 {
 #ifdef CONFIG_FEC_MPC52xx_MDIO
 	int ret;
-	ret = platform_driver_register(&mpc52xx_fec_mdio_driver);
+	ret = of_register_platform_driver(&mpc52xx_fec_mdio_driver);
 	if (ret) {
 		printk(KERN_ERR DRIVER_NAME ": failed to register mdio driver\n");
 		return ret;
 	}
 #endif
-	return platform_driver_register(&mpc52xx_fec_driver);
+	return of_register_platform_driver(&mpc52xx_fec_driver);
 }
 
 static void __exit
 mpc52xx_fec_exit(void)
 {
-	platform_driver_unregister(&mpc52xx_fec_driver);
+	of_unregister_platform_driver(&mpc52xx_fec_driver);
 #ifdef CONFIG_FEC_MPC52xx_MDIO
-	platform_driver_unregister(&mpc52xx_fec_mdio_driver);
+	of_unregister_platform_driver(&mpc52xx_fec_mdio_driver);
 #endif
 }
 

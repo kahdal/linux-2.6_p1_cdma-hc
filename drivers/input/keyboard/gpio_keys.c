@@ -31,7 +31,6 @@ struct gpio_button_data {
 	struct input_dev *input;
 	struct timer_list timer;
 	struct work_struct work;
-	int timer_debounce;	/* in msecs */
 	bool disabled;
 };
 
@@ -39,8 +38,6 @@ struct gpio_keys_drvdata {
 	struct input_dev *input;
 	struct mutex disable_lock;
 	unsigned int n_buttons;
-	int (*enable)(struct device *dev);
-	void (*disable)(struct device *dev);
 	struct gpio_button_data data[0];
 };
 
@@ -78,6 +75,83 @@ struct gpio_keys_drvdata {
  * We can disable only those keys which don't allow sharing the irq.
  */
 
+#if defined(CONFIG_MACH_P1)
+#ifdef CONFIG_KERNEL_DEBUG_SEC
+#include <linux/kernel_sec_common.h>
+struct timer_list debug_timer;
+struct gpio_keys_platform_data *g_pdata;
+
+void enter_upload_mode(unsigned long val)
+{
+	bool uploadmode = true;
+	int i;
+
+	// not to enter forced upload mode in boot PARAM_LOW
+	if( KERNEL_SEC_DEBUG_LEVEL_LOW == kernel_sec_get_debug_level() )
+		return;
+
+	for (i = 0; i < g_pdata->nbuttons; i++)
+	{
+		struct gpio_keys_button *button = &g_pdata->buttons[i];
+		if(gpio_get_value(button->gpio))
+		{
+			uploadmode = false;
+			break;
+		}
+	}
+
+	if(uploadmode)
+	{
+		if (kernel_sec_viraddr_wdt_reset_reg)
+		{
+		//dump_debug_info_forced_ramd_dump();
+#ifdef CONFIG_KERNEL_DEBUG_SEC
+#ifdef CONFIG_TARGET_LOCALE_KOR
+		local_irq_disable();
+		local_fiq_disable();
+#endif /* CONFIG_TARGET_LOCALE_KOR */
+#endif /* CONFIG_KERNEL_DEBUG_SEC */
+		kernel_sec_set_cp_upload();
+		kernel_sec_save_final_context(); // Save theh final context.
+		kernel_sec_set_upload_cause(UPLOAD_CAUSE_FORCED_UPLOAD);
+		kernel_sec_hw_reset(false);      // Reboot.
+		}
+	}
+}
+#endif
+
+/* For checking H/W faulty. */
+static ssize_t keyshort_test(struct device *dev, struct device_attribute *attr, char *buf)
+{
+       int i, ret=0;
+       int count;
+	struct gpio_keys_platform_data *pdata = dev->platform_data;
+
+	for(i = 0; i < pdata->nbuttons; i++ )
+	{
+	    struct gpio_keys_button *button = &pdata->buttons[i];
+	    ret = gpio_get_value( button->gpio);
+	    if(!ret)
+	        break;
+	}
+
+       if(!ret)
+	{
+		count = sprintf(buf,"PRESS\n");
+              printk(KERN_DEBUG "[Key] keyshort_test: PRESS\n");
+	}
+	else
+	{
+		count = sprintf(buf,"RELEASE\n");
+              printk(KERN_DEBUG "[Key] keyshort_test: RELEASE\n");
+	}
+
+	return count;
+}
+//static DEVICE_ATTR(key_pressed, S_IRUGO | S_IWUSR | S_IWOTH | S_IXOTH, keyshort_test, NULL);
+static DEVICE_ATTR(key_pressed, 0664 , keyshort_test, NULL);
+#endif
+
 /**
  * get_n_events_by_type() - returns maximum number of events per @type
  * @type: type of button (%EV_KEY, %EV_SW)
@@ -112,7 +186,7 @@ static void gpio_keys_disable_button(struct gpio_button_data *bdata)
 		 * Disable IRQ and possible debouncing timer.
 		 */
 		disable_irq(gpio_to_irq(bdata->button->gpio));
-		if (bdata->timer_debounce)
+		if (bdata->button->debounce_interval)
 			del_timer_sync(&bdata->timer);
 
 		bdata->disabled = true;
@@ -322,14 +396,90 @@ static void gpio_keys_report_event(struct gpio_button_data *bdata)
 	struct gpio_keys_button *button = bdata->button;
 	struct input_dev *input = bdata->input;
 	unsigned int type = button->type ?: EV_KEY;
-	int state = (gpio_get_value_cansleep(button->gpio) ? 1 : 0) ^ button->active_low;
+	int state = (gpio_get_value(button->gpio) ? 1 : 0) ^ button->active_low;
 
-	if (type == EV_ABS) {
-		if (state)
-			input_event(input, type, button->code, button->value);
-	} else {
-		input_event(input, type, button->code, !!state);
-	}
+#if defined(CONFIG_MACH_P1)
+#ifdef CONFIG_KERNEL_DEBUG_SEC
+        static bool first=false;
+        static bool second=false;
+#ifdef CONFIG_TARGET_LOCALE_KOR
+        static bool third=false;
+#endif /* CONFIG_TARGET_LOCALE_KOR */
+
+        if(state)
+        {
+            if(button->code == KEY_VOLUMEUP)
+            {
+                first = true;
+            }
+
+            if(button->code == KEY_VOLUMEDOWN)
+            {
+                second = true;
+            }
+
+/* forced upload should be very quick and on time, omit the timer operation */
+#ifdef CONFIG_TARGET_LOCALE_KOR
+            if(button->code == KEY_POWER)
+            {
+                third = true;
+            }
+
+            if(first&&second&&third)
+                enter_upload_mode();
+#endif /* CONFIG_TARGET_LOCALE_KOR */
+
+            /* Entering the forced upload mode should be pressed both volume keys
+            before pressing the power key */
+            if(first&&second)
+            {
+                if(button->code == KEY_POWER)
+                {
+                    mod_timer(&debug_timer, jiffies + HZ*2);
+                    printk(KERN_WARNING "[Key] Waiting for upload mode for 2 seconds.\n");
+                }
+            }
+        }
+        else
+        {
+            if(button->code == KEY_VOLUMEUP)
+            {
+                first = false;
+            }
+
+            if(button->code == KEY_VOLUMEDOWN)
+            {
+                second = false;
+            }
+#ifdef CONFIG_TARGET_LOCALE_KOR
+            if(button->code == KEY_POWER)
+            {
+                third = false;
+            }
+#endif /* CONFIG_TARGET_LOCALE_KOR */
+        }
+#endif // CONFIG_KERNEL_DEBUG_SEC
+
+    if(state)
+    {
+        button->pressed = true;
+    }
+    else
+    {
+        /*workaround irq bug in p1*/
+        if(!button->pressed)
+        {
+        }
+        else
+        {
+            input_event(input, type, button->code, 1);
+            input_sync(input);
+            msleep(1);
+        }
+        button->pressed = false;
+    }
+#endif
+	input_event(input, type, button->code, !!state);
 	input_sync(input);
 }
 
@@ -355,9 +505,9 @@ static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
 
 	BUG_ON(irq != gpio_to_irq(button->gpio));
 
-	if (bdata->timer_debounce)
+	if (button->debounce_interval)
 		mod_timer(&bdata->timer,
-			jiffies + msecs_to_jiffies(bdata->timer_debounce));
+			jiffies + msecs_to_jiffies(button->debounce_interval));
 	else
 		schedule_work(&bdata->work);
 
@@ -368,7 +518,7 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
 					 struct gpio_button_data *bdata,
 					 struct gpio_keys_button *button)
 {
-	const char *desc = button->desc ? button->desc : "gpio_keys";
+	char *desc = button->desc ? button->desc : "gpio_keys";
 	struct device *dev = &pdev->dev;
 	unsigned long irqflags;
 	int irq, error;
@@ -391,14 +541,6 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
 		goto fail3;
 	}
 
-	if (button->debounce_interval) {
-		error = gpio_set_debounce(button->gpio,
-					  button->debounce_interval * 1000);
-		/* use timer if gpiolib doesn't provide debounce */
-		if (error < 0)
-			bdata->timer_debounce = button->debounce_interval;
-	}
-
 	irq = gpio_to_irq(button->gpio);
 	if (irq < 0) {
 		error = irq;
@@ -415,8 +557,8 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
 	if (!button->can_disable)
 		irqflags |= IRQF_SHARED;
 
-	error = request_any_context_irq(irq, gpio_keys_isr, irqflags, desc, bdata);
-	if (error < 0) {
+	error = request_irq(irq, gpio_keys_isr, irqflags, desc, bdata);
+	if (error) {
 		dev_err(dev, "Unable to claim irq %d; error %d\n",
 			irq, error);
 		goto fail3;
@@ -428,21 +570,6 @@ fail3:
 	gpio_free(button->gpio);
 fail2:
 	return error;
-}
-
-static int gpio_keys_open(struct input_dev *input)
-{
-	struct gpio_keys_drvdata *ddata = input_get_drvdata(input);
-
-	return ddata->enable ? ddata->enable(input->dev.parent) : 0;
-}
-
-static void gpio_keys_close(struct input_dev *input)
-{
-	struct gpio_keys_drvdata *ddata = input_get_drvdata(input);
-
-	if (ddata->disable)
-		ddata->disable(input->dev.parent);
 }
 
 static int __devinit gpio_keys_probe(struct platform_device *pdev)
@@ -466,18 +593,13 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 
 	ddata->input = input;
 	ddata->n_buttons = pdata->nbuttons;
-	ddata->enable = pdata->enable;
-	ddata->disable = pdata->disable;
 	mutex_init(&ddata->disable_lock);
 
 	platform_set_drvdata(pdev, ddata);
-	input_set_drvdata(input, ddata);
 
-	input->name = pdata->name ? : pdev->name;
+	input->name = pdev->name;
 	input->phys = "gpio-keys/input0";
 	input->dev.parent = &pdev->dev;
-	input->open = gpio_keys_open;
-	input->close = gpio_keys_close;
 
 	input->id.bustype = BUS_HOST;
 	input->id.vendor = 0x0001;
@@ -520,12 +642,26 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 		goto fail3;
 	}
 
+#if !defined(CONFIG_MACH_P1)
 	/* get current state of buttons */
 	for (i = 0; i < pdata->nbuttons; i++)
 		gpio_keys_report_event(&ddata->data[i]);
 	input_sync(input);
+#endif
 
 	device_init_wakeup(&pdev->dev, wakeup);
+
+#if defined(CONFIG_MACH_P1)
+	if (device_create_file(&pdev->dev, &dev_attr_key_pressed) < 0)
+	{
+		pr_err("Failed to create device file(%s)!\n", dev_attr_key_pressed.attr.name);
+	}
+#ifdef CONFIG_KERNEL_DEBUG_SEC
+        g_pdata = pdata;
+        init_timer(&debug_timer);
+        debug_timer.function = enter_upload_mode;
+#endif
+#endif
 
 	return 0;
 
@@ -534,7 +670,7 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
  fail2:
 	while (--i >= 0) {
 		free_irq(gpio_to_irq(pdata->buttons[i].gpio), &ddata->data[i]);
-		if (ddata->data[i].timer_debounce)
+		if (pdata->buttons[i].debounce_interval)
 			del_timer_sync(&ddata->data[i].timer);
 		cancel_work_sync(&ddata->data[i].work);
 		gpio_free(pdata->buttons[i].gpio);
@@ -562,7 +698,7 @@ static int __devexit gpio_keys_remove(struct platform_device *pdev)
 	for (i = 0; i < pdata->nbuttons; i++) {
 		int irq = gpio_to_irq(pdata->buttons[i].gpio);
 		free_irq(irq, &ddata->data[i]);
-		if (ddata->data[i].timer_debounce)
+		if (pdata->buttons[i].debounce_interval)
 			del_timer_sync(&ddata->data[i].timer);
 		cancel_work_sync(&ddata->data[i].work);
 		gpio_free(pdata->buttons[i].gpio);
@@ -596,6 +732,20 @@ static int gpio_keys_suspend(struct device *dev)
 
 static int gpio_keys_resume(struct device *dev)
 {
+#if defined(CONFIG_MACH_P1)
+	struct platform_device *pdev = to_platform_device(dev);
+	struct gpio_keys_platform_data *pdata = pdev->dev.platform_data;
+	int i;
+
+	for (i = 0; i < pdata->nbuttons; i++) {
+
+		struct gpio_keys_button *button = &pdata->buttons[i];
+		if (button->wakeup && device_may_wakeup(&pdev->dev)) {
+			int irq = gpio_to_irq(button->gpio);
+			disable_irq_wake(irq);
+		}
+	}
+#else
 	struct platform_device *pdev = to_platform_device(dev);
 	struct gpio_keys_drvdata *ddata = platform_get_drvdata(pdev);
 	struct gpio_keys_platform_data *pdata = pdev->dev.platform_data;
@@ -612,6 +762,7 @@ static int gpio_keys_resume(struct device *dev)
 		gpio_keys_report_event(&ddata->data[i]);
 	}
 	input_sync(ddata->input);
+#endif
 
 	return 0;
 }
