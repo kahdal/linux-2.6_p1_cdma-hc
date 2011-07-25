@@ -1,4 +1,4 @@
 #!/bin/bash
 
-find ~/kernel/hc-sgt/ -name '*.ko' -exec cp -v {} ~/kernel/hc-sgt/lib/modules \;
-echo "`find ~/kernel/hc-sgt/ -name '*.ko' | wc -l` module(s) copied"
+find ~/kernel/linux-2.6_p1_cdma-hc/ -name '*.ko' -exec cp -v {} ~/kernel/hc-sgt_initramfs/lib/modules \;
+echo "`find ~/kernel/linux-2.6_p1_cdma-hc/ -name '*.ko' | wc -l` module(s) copied"
